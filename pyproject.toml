@@ -1,0 +1,24 @@
+[project]
+name = "video-transcriber"
+version = "0.1.0"
+description = "Local video and audio transcription with speaker diarization, powered by WhisperX (faster-whisper + pyannote). GUI and CLI, fully offline."
+readme = "README.md"
+authors = [{ name = "Juan Pablo Gómez Veira" }]
+requires-python = ">=3.12"
+dependencies = [
+    "tkinterdnd2>=0.6.2",
+    "torch>=2.8.0",
+    "torchaudio>=2.8.0",
+    "torchvision>=0.23.0",
+    "whisperx>=3.8.6",
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+torchaudio = { index = "pytorch-cu128" }
+torchvision = { index = "pytorch-cu128" }
