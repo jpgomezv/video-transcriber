@@ -1021,6 +1021,15 @@ def _diarize_write(prep: dict, args, cache: ModelCache) -> dict | None:
     phase("diarize")
     diarized = False
     if not args.no_diarize:
+        # Diarization is the most VRAM-hungry stage; warn at the exact moment
+        # if the GPU is being shared with other apps (browsers, games), which
+        # makes it take several times longer.
+        gpu_now = gpu_status()
+        if gpu_is_busy(gpu_now):
+            print("[warn] La GPU está compartida con otras aplicaciones; la "
+                  "diarización puede tardar varias veces más de lo normal.\n"
+                  "  Cierra navegadores, juegos u otras apps con GPU para"
+                  " acelerar. (Puedes detener y continuar después.)")
         token = resolve_token(args)
         if token:
             t0 = time.monotonic()
