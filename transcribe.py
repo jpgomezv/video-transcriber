@@ -218,108 +218,25 @@ def display_speaker(sp: str | None, names: dict) -> str | None:
     return names.get(sp, sp)
 
 
-def _collapse_word_loops(text: str, min_run: int = 5):
-    """Collapse runs of words repeated min_run+ times in a row.
+def drop_repeated_segments(segments: list, min_logprob: float = -1.0) -> list:
+    """Drop segments Whisper produced while failing.
 
-    Covers both common Whisper hallucination shapes:
-      - single-word loops:  "artificiales artificiales artificiales ..."
-      - 2-word alternating: "de la de la de la de la de la ..."
-
-    Loops can start mid-text (Whisper attaches a prefix before looping), so we
-    scan through the token stream. Punctuation is ignored when comparing.
-    Returns (new_text, runs_collapsed)."""
-    tokens = text.split(" ")
-
-    def norm(tok: str) -> str:
-        return tok.strip(".,;:!?¡¿").lower()
-
-    def collapse_run(start: int, period: int) -> tuple[int, int]:
-        """Collapse the repeating [start:] run of period 1 (same word) or
-        period 2 (alternating). Returns (new_new_len... ) -> (kept, removed)."""
-        kept = tokens[:start + period]
-        return (start + period), (len(tokens) - start - period)
-
-    # Find the earliest repeating single-word run (>= min_run same word),
-    # then the earliest 2-word alternating run (>= min_run tokens).
-    best_cut = None   # (cut_index, period)
-    i = 0
-    while i < len(tokens):
-        # single-word run starting at i
-        j = i + 1
-        core = norm(tokens[i])
-        while j < len(tokens) and core and norm(tokens[j]) == core:
-            j += 1
-        if j - i >= min_run:
-            best_cut = (i, 1)
-            break
-        i = j if j > i else j + 1
-
-    if best_cut is None:
-        i = 0
-        while i + 2 < len(tokens):
-            a, b = norm(tokens[i]), norm(tokens[i + 1])
-            if a and b and a != b:
-                j = i + 2
-                while j + 1 < len(tokens) and (
-                    (j - i) % 2 == 0 and norm(tokens[j]) == a or
-                    (j - i) % 2 == 1 and norm(tokens[j]) == b
-                ):
-                    j += 1
-                # need a full alternating pair count
-                if j - i >= min_run:
-                    best_cut = (i, 2)
-                    break
-                i = i + 1
-            else:
-                i += 1
-
-    if best_cut is None:
-        return text, 0
-
-    cut, period = best_cut
-    if period == 1:
-        kept = tokens[:cut + 1]
-    else:
-        kept = tokens[:cut + 2]
-    return " ".join(kept), len(tokens) - len(kept)
-
-
-def drop_repeated_segments(segments: list) -> list:
-    """Hallucination guard, two passes:
-
-    1. Collapse words repeated 5+ times inside a segment
-       ("artificiales artificiales artificiales ..." -> "artificiales").
-    2. Drop segments whose text exactly repeats the previous one (10+ chars).
-
-    Both are the classic Whisper hallucination patterns on silence/music.
-    Conservative by design: only exact, adjacent repetition is touched."""
+    Uses Whisper's own `log_prob_threshold` (-1.0): the model-native signal
+    that a segment was guessed, not heard. This is exactly what OpenAI's
+    pipeline applies at transcription time but WhisperX's batched path skips;
+    it is NOT a text-pattern hack. Real speech — even real speech that repeats
+    words — carries healthy confidence (measured on real classes: -0.04 to
+    -0.36), so it is never touched."""
     out: list[dict] = []
-    prev: str | None = None
     dropped = 0
-    collapsed_runs = 0
     for seg in segments:
-        text = seg.get("text", "").strip()
-        if not text:
-            continue
-
-        new_text, runs = _collapse_word_loops(text)
-        collapsed_runs += runs
-        if new_text != text:
-            seg = {**seg, "text": new_text}
-            text = new_text
-
-        if len(text) >= 10 and text == prev:
+        lp = seg.get("avg_logprob")
+        if lp is not None and lp < min_logprob:
             dropped += 1
             continue
-        prev = text
         out.append(seg)
-    if collapsed_runs or dropped:
-        parts = []
-        if collapsed_runs:
-            parts.append(f"collapsed {collapsed_runs} word-loop(s)")
-        if dropped:
-            parts.append(f"dropped {dropped} repeated segment(s)")
-        print(f"[info] Hallucination guard: {'; '.join(parts)}.")
+    if dropped:
+        print(f"[info] Hallucination guard: dropped {dropped} failed segment(s).")
     return out
 
 
