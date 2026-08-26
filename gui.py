@@ -427,7 +427,7 @@ class App(TkinterDnD.Tk):
         if self.running:
             self.stop_requested = True
             self.btn_stop.config(state="disabled")
-            self.status.config(text="Deteniendo después del archivo en curso...")
+            self.status.config(text="Deteniendo tras el archivo en curso...")
 
     def open_output(self):
         folder = self.last_output_dir or (
@@ -555,10 +555,13 @@ class App(TkinterDnD.Tk):
                               " restantes — cierra otras apps que usen GPU y"
                               " vuelve a ejecutar.\n")
                         break
-            # Stage 2: diarize + write every file (ASR evicted, so it stays fast)
+            # Stage 2: diarize + write every file (ASR evicted, so it stays fast).
+            # A user stop only halts *starting new work*; files already
+            # transcribed are still diarized and written. Only a fatal GPU
+            # error skips them entirely.
             for i, prep in enumerate(prepared, start=1):
-                if fatal or self.stop_requested:
-                    q.put("[warn] Detenido por el usuario; archivos restantes omitidos.\n")
+                if fatal:
+                    q.put("\n[error] La GPU se perdió; se omitió el resto del lote.\n")
                     break
                 q.put(("status", f"Identificando hablantes {i}/{len(prepared)}: "
                                  f"{Path(prep['path']).name}..."))
