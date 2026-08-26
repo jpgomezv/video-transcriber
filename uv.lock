@@ -2641,6 +2641,18 @@ wheels = [
 ]
 
 [[package]]
+name = "ttkbootstrap"
+version = "2.2.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "pillow" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/94/25/2f432d4bf0a04ed783d3e6d913295f6163bffb158a0bb3fbd9d3e1fc903b/ttkbootstrap-2.2.2.tar.gz", hash = "sha256:b3bd4e615b3462bc3201d09cf22a87692a6d67f9de53127967ed726a4be24d2d", size = 603324, upload-time = "2026-08-17T12:36:52.872Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/15/d6/5e63a7b0da1d5a1e61d6651dac99a761544a75ed97c5d58cbcce0d0abb90/ttkbootstrap-2.2.2-py3-none-any.whl", hash = "sha256:b268daf53e73fb3d50482ec743a675e325ec644afe7fb706b6bbee35fda489f8", size = 552812, upload-time = "2026-08-17T12:36:51.486Z" },
+]
+
+[[package]]
 name = "typing-extensions"
 version = "4.16.0"
 source = { registry = "https://pypi.org/simple" }
@@ -2676,6 +2688,7 @@ dependencies = [
     { name = "torch" },
     { name = "torchaudio" },
     { name = "torchvision" },
+    { name = "ttkbootstrap" },
     { name = "whisperx" },
 ]
 
@@ -2685,6 +2698,7 @@ requires-dist = [
     { name = "torch", specifier = ">=2.8.0", index = "https://download.pytorch.org/whl/cu128" },
     { name = "torchaudio", specifier = ">=2.8.0", index = "https://download.pytorch.org/whl/cu128" },
     { name = "torchvision", specifier = ">=0.23.0", index = "https://download.pytorch.org/whl/cu128" },
+    { name = "ttkbootstrap", specifier = ">=2.2.2" },
     { name = "whisperx", specifier = ">=3.8.6" },
 ]
 

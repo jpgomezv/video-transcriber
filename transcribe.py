@@ -6,7 +6,8 @@ Runs entirely on your machine; no uploads, no limits.
 
 Default output: timestamped Markdown transcript + SRT subtitles. Optionally also
 VTT subtitles (open the original video in VLC and load the .srt to verify the
-transcript against the recording) and a JSON dump of all segments.
+transcript against the recording), plain-text transcript, and a JSON dump of all
+segments.
 
 Speaker diarization (who said what) uses a free Hugging Face token — one-time setup:
   1. Create a (free) account + read token:  https://huggingface.co/settings/tokens
@@ -15,11 +16,11 @@ Then set the HF_TOKEN environment variable, or pass --hf-token. Without a token 
 transcript is produced but WITHOUT speaker labels (and a warning is printed).
 
 Examples:
-  uv run transcribe.py "C:\\Downloads\\video1.mp4"
-  uv run transcribe.py "C:\\Downloads\\video1.mp4" --formats markdown,srt,vtt --lang es
-  uv run transcribe.py "C:\\Downloads\\videos" --model large-v3-turbo --batch-size 8
+  uv run transcribe.py "C:\\media\\video1.mp4"
+  uv run transcribe.py "C:\\media\\video1.mp4" --formats markdown,srt,vtt --lang es
+  uv run transcribe.py "C:\\media\\videos" --model large-v3-turbo --batch-size 8
   uv run transcribe.py video.mp4 --auto-speaker --speaker-name Profesor
-  uv run transcribe.py video.mp4 --no-diarize      # skip speaker labels
+  uv run transcribe.py video.mp4 --no-diarize           # skip speaker labels
 """
 
 from __future__ import annotations
@@ -32,6 +33,7 @@ import sys
 import time
 import datetime
 import shutil
+import traceback
 import warnings
 from pathlib import Path
 
@@ -59,6 +61,61 @@ ASR_MODEL_REPOS = {
 }
 
 DIARIZE_MODEL_REPO = "pyannote/speaker-diarization-community-1"
+
+APP_DATA_DIR = Path(os.environ.get(
+    "LOCALAPPDATA", str(Path.home() / "AppData" / "Local")
+)) / "video-transcriber"
+LOG_DIR = APP_DATA_DIR / "logs"
+LOG_KEEP = 30
+
+
+def new_log_path() -> Path:
+    """Path for a fresh per-run log file; prunes old logs beyond LOG_KEEP."""
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    path = LOG_DIR / f"run-{stamp}.log"
+    try:
+        logs = sorted(LOG_DIR.glob("run-*.log"))
+        for old in logs[:-LOG_KEEP]:
+            old.unlink(missing_ok=True)
+    except Exception:
+        pass
+    return path
+
+
+class Tee:
+    """Duplicates writes to a log file while keeping the original stream."""
+
+    def __init__(self, stream, log):
+        self._stream = stream
+        self._log = log
+
+    def write(self, text):
+        if not text:
+            return
+        try:
+            self._stream.write(text)
+        except Exception:
+            pass
+        try:
+            self._log.write(text)
+            self._log.flush()
+        except Exception:
+            pass
+
+    def flush(self):
+        try:
+            self._stream.flush()
+        except Exception:
+            pass
+
+# Subtitle layout targets (broadcast-ish): a cue is at most 2 lines of ~44
+# characters and at most ~5 seconds long.
+CUE_MAX_CHARS = 88
+CUE_MAX_LINE = 44
+CUE_MAX_LINES = 2
+CUE_MAX_SECONDS = 5.0
+MIN_CUE_SECONDS = 0.6
 
 
 def ensure_model(repo_id: str, local_name: str, marker: str = "config.json") -> Path:
@@ -119,14 +176,12 @@ def speaker_of(seg: dict) -> str | None:
 
 
 def merge_segments(segments: list, max_chars: int, max_seconds: float, min_break_chars: int) -> list:
-    """Merge short consecutive segments into readable lines.
+    """Merge short consecutive segments into readable blocks.
 
     Fixes the "one word per subtitle" problem: whisperx can emit very short
     segments (especially after per-speaker splitting), which would otherwise
-    produce illegible, oversized subtitle files. We merge until a line reaches
-    a sensible size, breaking on speaker changes only once a line is long
-    enough (so a noisy per-word speaker alternation can't fragment everything).
-    """
+    produce illegible output. Blocks are kept within one speaker — a speaker
+    change always starts a new block (never an inline "[SPEAKER_X]" marker)."""
     merged: list[dict] = []
     cur: dict | None = None
     for seg in segments:
@@ -140,9 +195,8 @@ def merge_segments(segments: list, max_chars: int, max_seconds: float, min_break
 
         new_len = len(cur["text"]) + 1 + len(text)
         new_span = seg["end"] - cur["start"]
-        speaker_changed = sp != cur["speaker"]
         break_line = (
-            (speaker_changed and len(cur["text"]) >= min_break_chars)
+            sp != cur["speaker"]           # never merge across speakers
             or new_len > max_chars
             or new_span > max_seconds
         )
@@ -150,10 +204,7 @@ def merge_segments(segments: list, max_chars: int, max_seconds: float, min_break
             merged.append(cur)
             cur = {"start": seg["start"], "end": seg["end"], "speaker": sp, "text": text}
         else:
-            if speaker_changed:
-                cur["text"] += f" [{sp}] {text}"
-            else:
-                cur["text"] += " " + text
+            cur["text"] += " " + text
             cur["end"] = seg["end"]
 
     if cur:
@@ -167,9 +218,215 @@ def display_speaker(sp: str | None, names: dict) -> str | None:
     return names.get(sp, sp)
 
 
+def _collapse_word_loops(text: str, min_run: int = 5):
+    """Collapse runs of words repeated min_run+ times in a row.
+
+    Covers both common Whisper hallucination shapes:
+      - single-word loops:  "artificiales artificiales artificiales ..."
+      - 2-word alternating: "de la de la de la de la de la ..."
+
+    Loops can start mid-text (Whisper attaches a prefix before looping), so we
+    scan through the token stream. Punctuation is ignored when comparing.
+    Returns (new_text, runs_collapsed)."""
+    tokens = text.split(" ")
+
+    def norm(tok: str) -> str:
+        return tok.strip(".,;:!?¡¿").lower()
+
+    def collapse_run(start: int, period: int) -> tuple[int, int]:
+        """Collapse the repeating [start:] run of period 1 (same word) or
+        period 2 (alternating). Returns (new_new_len... ) -> (kept, removed)."""
+        kept = tokens[:start + period]
+        return (start + period), (len(tokens) - start - period)
+
+    # Find the earliest repeating single-word run (>= min_run same word),
+    # then the earliest 2-word alternating run (>= min_run tokens).
+    best_cut = None   # (cut_index, period)
+    i = 0
+    while i < len(tokens):
+        # single-word run starting at i
+        j = i + 1
+        core = norm(tokens[i])
+        while j < len(tokens) and core and norm(tokens[j]) == core:
+            j += 1
+        if j - i >= min_run:
+            best_cut = (i, 1)
+            break
+        i = j if j > i else j + 1
+
+    if best_cut is None:
+        i = 0
+        while i + 2 < len(tokens):
+            a, b = norm(tokens[i]), norm(tokens[i + 1])
+            if a and b and a != b:
+                j = i + 2
+                while j + 1 < len(tokens) and (
+                    (j - i) % 2 == 0 and norm(tokens[j]) == a or
+                    (j - i) % 2 == 1 and norm(tokens[j]) == b
+                ):
+                    j += 1
+                # need a full alternating pair count
+                if j - i >= min_run:
+                    best_cut = (i, 2)
+                    break
+                i = i + 1
+            else:
+                i += 1
+
+    if best_cut is None:
+        return text, 0
+
+    cut, period = best_cut
+    if period == 1:
+        kept = tokens[:cut + 1]
+    else:
+        kept = tokens[:cut + 2]
+    return " ".join(kept), len(tokens) - len(kept)
+
+
+def drop_repeated_segments(segments: list) -> list:
+    """Hallucination guard, two passes:
+
+    1. Collapse words repeated 5+ times inside a segment
+       ("artificiales artificiales artificiales ..." -> "artificiales").
+    2. Drop segments whose text exactly repeats the previous one (10+ chars).
+
+    Both are the classic Whisper hallucination patterns on silence/music.
+    Conservative by design: only exact, adjacent repetition is touched."""
+    out: list[dict] = []
+    prev: str | None = None
+    dropped = 0
+    collapsed_runs = 0
+    for seg in segments:
+        text = seg.get("text", "").strip()
+        if not text:
+            continue
+
+        new_text, runs = _collapse_word_loops(text)
+        collapsed_runs += runs
+        if new_text != text:
+            seg = {**seg, "text": new_text}
+            text = new_text
+
+        if len(text) >= 10 and text == prev:
+            dropped += 1
+            continue
+        prev = text
+        out.append(seg)
+    if collapsed_runs or dropped:
+        parts = []
+        if collapsed_runs:
+            parts.append(f"collapsed {collapsed_runs} word-loop(s)")
+        if dropped:
+            parts.append(f"dropped {dropped} repeated segment(s)")
+        print(f"[info] Hallucination guard: {'; '.join(parts)}.")
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# Subtitle cue building (merge + wrap + split long sentences)
+# --------------------------------------------------------------------------- #
+
+def _wrap_lines(text: str, max_line: int, max_lines: int) -> list[str]:
+    """Greedy word wrap into at most `max_lines` lines. Text that still does not
+    fit joins the last line (slight overflow beats a third line)."""
+    words = text.split()
+    if not words:
+        return [text]
+    lines = [""]
+    for word in words:
+        cand = f"{lines[-1]} {word}".strip()
+        if len(cand) <= max_line or len(lines) == max_lines:
+            lines[-1] = cand
+        else:
+            lines.append(word)
+    return lines
+
+
+def build_cues(segments: list, first_line_reserve: int = 0) -> list[dict]:
+    """Turn raw segments into properly sized subtitle cues.
+
+    Words are packed into lines of at most CUE_MAX_LINE characters, lines are
+    grouped into cues of at most CUE_MAX_LINES lines, and cue timings are
+    interpolated proportionally to text length so subtitles stay roughly in
+    sync with the speech. `first_line_reserve` shrinks each cue's first line to
+    leave room for a speaker tag."""
+    blocks = merge_segments(segments, max_chars=240,
+                            max_seconds=12.0, min_break_chars=25)
+
+    def line_budget(idx_in_cue: int) -> int:
+        return CUE_MAX_LINE - (first_line_reserve if idx_in_cue == 0 else 0)
+
+    cues: list[dict] = []
+    for block in blocks:
+        text = block["text"].strip()
+        if not text:
+            continue
+
+        # 1. Pack words into cues: each cue holds up to CUE_MAX_LINES lines,
+        #    the first one shortened by the speaker-tag reserve.
+        cue_lines: list[str] = []
+        all_cues: list[list[str]] = []
+
+        def flush_cue() -> None:
+            nonlocal cue_lines
+            if cue_lines:
+                all_cues.append(cue_lines)
+                cue_lines = []
+
+        for word in text.split():
+            if not cue_lines:
+                cue_lines.append(word)
+                continue
+            is_first_line = len(cue_lines) == 1
+            budget = line_budget(0) if is_first_line else CUE_MAX_LINE
+            cand = f"{cue_lines[-1]} {word}"
+            if len(cand) <= budget:
+                cue_lines[-1] = cand
+            elif len(cue_lines) < CUE_MAX_LINES:
+                cue_lines.append(word)
+            else:
+                flush_cue()
+                cue_lines.append(word)
+        flush_cue()
+
+        # 2. Interpolate timings across the block, proportional to length.
+        span = max(MIN_CUE_SECONDS * len(all_cues), block["end"] - block["start"])
+        total_chars = sum(len(" ".join(g)) for g in all_cues) or 1
+        consumed = 0.0
+        prev_end = block["start"]
+        for group in all_cues:
+            c_start = prev_end
+            consumed += len(" ".join(group))
+            c_end = block["start"] + span * (consumed / total_chars)
+            c_end = max(c_end, c_start + MIN_CUE_SECONDS)
+            prev_end = c_end
+            cues.append({
+                "start": c_start,
+                "end": c_end,
+                "speaker": block["speaker"],
+                "lines": group,
+            })
+
+    # Enforce monotonic, non-zero-length cues.
+    for prev, cur in zip(cues, cues[1:]):
+        if cur["start"] < prev["end"]:
+            cur["start"] = prev["end"]
+        if cur["end"] <= cur["start"]:
+            cur["end"] = cur["start"] + MIN_CUE_SECONDS
+    return cues
+
+
 # --------------------------------------------------------------------------- #
 # Output writers
 # --------------------------------------------------------------------------- #
+
+def _write_text(path: Path, content: str) -> None:
+    """Atomic write: a crash mid-write can't leave a truncated output file."""
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(content, encoding="utf-8")
+    os.replace(tmp, path)
+
 
 def write_markdown(path: Path, title: str, source: str, meta: dict, segments: list, names: dict) -> None:
     merged = merge_segments(segments, max_chars=300, max_seconds=90, min_break_chars=25)
@@ -192,100 +449,135 @@ def write_markdown(path: Path, title: str, source: str, meta: dict, segments: li
         else:
             lines.append(f"{ts} {text}")
         lines.append("")
-    path.write_text("\n".join(lines), encoding="utf-8")
+    _write_text(path, "\n".join(lines))
+
+
+def _speaker_tag_reserve(segments: list, names: dict) -> int:
+    """Characters to reserve on a cue's first line for the longest speaker tag."""
+    tags = {display_speaker(speaker_of(s), names) or "" for s in segments}
+    longest = max((len(t) for t in tags if t), default=0)
+    return longest + 3 if longest else 0
 
 
 def write_srt(path: Path, segments: list, names: dict) -> None:
-    merged = merge_segments(segments, max_chars=60, max_seconds=5.0, min_break_chars=20)
+    reserve = _speaker_tag_reserve(segments, names)
+    cues = build_cues(segments, first_line_reserve=reserve)
     blocks = []
-    for i, seg in enumerate(merged, start=1):
-        text = seg["text"].strip()
-        if not text:
-            continue
-        sp = display_speaker(speaker_of(seg), names)
-        body = f"[{sp}] {text}" if sp else text
-        blocks.append(
-            f"{i}\n{srt_ts(seg['start'])} --> {srt_ts(seg['end'])}\n{body}\n"
-        )
-    path.write_text("\n".join(blocks), encoding="utf-8")
+    for i, cue in enumerate(cues, start=1):
+        body = "\n".join(cue["lines"])
+        sp = display_speaker(speaker_of(cue), names)
+        if sp:
+            body = f"[{sp}] {body}"
+        blocks.append(f"{i}\n{srt_ts(cue['start'])} --> {srt_ts(cue['end'])}\n{body}\n")
+    _write_text(path, "\n".join(blocks))
 
 
 def write_vtt(path: Path, segments: list, names: dict) -> None:
-    merged = merge_segments(segments, max_chars=60, max_seconds=5.0, min_break_chars=20)
+    reserve = _speaker_tag_reserve(segments, names)
+    cues = build_cues(segments, first_line_reserve=reserve)
     blocks = ["WEBVTT", ""]
+    for cue in cues:
+        body = "\n".join(cue["lines"])
+        sp = display_speaker(speaker_of(cue), names)
+        if sp:
+            body = f"<v {sp}>{body}</v>"
+        blocks.append(f"{vtt_ts(cue['start'])} --> {vtt_ts(cue['end'])}\n{body}\n")
+    _write_text(path, "\n".join(blocks))
+
+
+def write_txt(path: Path, title: str, meta: dict, segments: list, names: dict) -> None:
+    merged = merge_segments(segments, max_chars=300, max_seconds=90, min_break_chars=25)
+    lines = [
+        title,
+        f"{meta.get('language', '?')} · {meta.get('model')} · "
+        f"{'diarized' if meta.get('diarized') else 'no diarization'}",
+        "",
+    ]
     for seg in merged:
+        sp = display_speaker(speaker_of(seg), names)
         text = seg["text"].strip()
         if not text:
             continue
-        sp = display_speaker(speaker_of(seg), names)
+        prefix = f"[{hms(seg['start'])}] "
         if sp:
-            body = f"<v {sp}>{text}</v>"
+            lines.append(f"{prefix}{sp}: {text}")
         else:
-            body = text
-        blocks.append(f"{vtt_ts(seg['start'])} --> {vtt_ts(seg['end'])}\n{body}\n")
-    path.write_text("\n".join(blocks), encoding="utf-8")
+            lines.append(f"{prefix}{text}")
+    _write_text(path, "\n".join(lines) + "\n")
 
 
 def write_json(path: Path, result: dict) -> None:
-    path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    _write_text(path, json.dumps(result, ensure_ascii=False, indent=2))
 
 
 # --------------------------------------------------------------------------- #
-# Speaker helpers (auto-teacher + voice clips)
+# Speaker helpers (main-speaker detection + voice clips)
 # --------------------------------------------------------------------------- #
 
-def dominant_speaker(segments: list) -> tuple[str | None, float]:
-    """Return (speaker_label, total_seconds) of the speaker with the most
-    speaking time — the heuristic for "the teacher is who talks the most"."""
+def speaker_totals(segments: list) -> dict[str, float]:
+    """Total speaking time per speaker label."""
     totals: dict[str, float] = {}
     for seg in segments:
         sp = speaker_of(seg)
         if sp:
             totals[sp] = totals.get(sp, 0.0) + (seg["end"] - seg["start"])
+    return totals
+
+
+def dominant_speaker(segments: list) -> tuple[str | None, float]:
+    """Return (speaker_label, total_seconds) of the speaker with the most
+    speaking time."""
+    totals = speaker_totals(segments)
     if not totals:
         return None, 0.0
     best = max(totals, key=totals.get)
     return best, totals[best]
 
 
-def extract_speaker_clips(audio, segments: list, out_dir, clip_seconds: float = 6.0) -> dict:
-    """Save one short WAV per speaker (their longest turn, center-cropped) so a
-    human can hear the voices. Returns {speaker_label: wav_path}."""
+def extract_speaker_clips(audio, segments: list, out_dir, clip_seconds: float = 6.0,
+                          samples: int = 3) -> dict:
+    """Save up to `samples` short WAVs per speaker (their longest turns,
+    center-cropped) so a human can hear each voice several times.
+    Returns {speaker_label: [wav_path, ...]}."""
     import wave
 
     import numpy as np
 
-    best: dict[str, tuple[float, float, float]] = {}
+    turns: dict[str, list[tuple[float, float, float]]] = {}
     for seg in segments:
         sp = speaker_of(seg)
         if not sp:
             continue
         dur = seg["end"] - seg["start"]
-        if sp not in best or dur > best[sp][0]:
-            best[sp] = (dur, seg["start"], seg["end"])
+        if dur < 2.0:
+            continue
+        turns.setdefault(sp, []).append((dur, seg["start"], seg["end"]))
 
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    clips: dict[str, str] = {}
-    for sp, (dur, start, end) in best.items():
-        if dur < 2.0:
-            continue
-        mid = (start + end) / 2.0
-        cstart = max(start, mid - clip_seconds / 2)
-        cend = min(end, cstart + clip_seconds)
-        if cend - cstart < 1.5:
-            cstart = max(start, cend - 1.5)
-        s = int(cstart * 16000)
-        e = int(cend * 16000)
-        samples = np.clip(audio[s:e], -1.0, 1.0)
-        pcm = (samples * 32767).astype(np.int16)
-        path = out_dir / f"{sp}.wav"
-        with wave.open(str(path), "wb") as w:
-            w.setnchannels(1)
-            w.setsampwidth(2)
-            w.setframerate(16000)
-            w.writeframes(pcm.tobytes())
-        clips[sp] = str(path)
+    clips: dict[str, list[str]] = {}
+    for sp, sp_turns in turns.items():
+        sp_turns.sort(reverse=True)
+        chosen = sp_turns[:samples]
+        paths: list[str] = []
+        for idx, (dur, start, end) in enumerate(chosen, start=1):
+            mid = (start + end) / 2.0
+            cstart = max(start, mid - clip_seconds / 2)
+            cend = min(end, cstart + clip_seconds)
+            if cend - cstart < 1.5:
+                cstart = max(start, cend - 1.5)
+            s = int(cstart * 16000)
+            e = int(cend * 16000)
+            pcm = (np.clip(audio[s:e], -1.0, 1.0) * 32767).astype(np.int16)
+            path = out_dir / f"{sp}_{idx}.wav"
+            with wave.open(str(path), "wb") as w:
+                w.setnchannels(1)
+                w.setsampwidth(2)
+                w.setframerate(16000)
+                w.writeframes(pcm.tobytes())
+            paths.append(str(path))
+        if paths:
+            clips[sp] = paths
     return clips
 
 
@@ -332,6 +624,26 @@ def free_gpu() -> None:
     if torch is not None and torch.cuda.is_available():
         gc.collect()
         torch.cuda.empty_cache()
+
+
+def _is_cuda_oom(exc: Exception) -> bool:
+    text = f"{type(exc).__name__}: {exc}"
+    return "OutOfMemoryError" in type(exc).__name__ or "out of memory" in text.lower()
+
+
+def _is_cuda_fatal(exc: Exception) -> bool:
+    """True when the GPU device/context was lost (unrecoverable in-process)."""
+    text = f"{type(exc).__name__}: {exc}"
+    low = text.lower()
+    return any(k in low for k in (
+        "invalid device ordinal",
+        "no cuda-capable device",
+        "device-side assert",
+        "no kernel image",
+        "driver shutting down",
+        "cuda error: out of range",
+        "not used",
+    ))
 
 
 def quiet_third_party_noise() -> None:
@@ -414,36 +726,83 @@ def progress_printer():
     return cb
 
 
-def transcribe_one(path: Path, args) -> dict | None:
+class ModelCache:
+    """Keeps the small alignment and diarization models loaded between files.
+
+    The big ASR model is NOT kept cached across the diarization step: its
+    CTranslate2 weights occupy VRAM that pyannote needs, making diarization
+    ~5x slower. transcribe_one evicts it after transcription and reloads it
+    per file instead."""
+
+    def __init__(self) -> None:
+        self._items: dict = {}
+
+    def get(self, key):
+        return self._items.get(key)
+
+    def put(self, key, value):
+        self._items[key] = value
+
+    def evict(self, key) -> bool:
+        obj = self._items.pop(key, None)
+        return obj is not None
+
+
+def _transcribe_align(path: Path, args, cache: ModelCache) -> dict:
+    """Stage 1 of a file: load ASR (cached across the batch), transcribe,
+    evict the ASR model, align, run the hallucination guard.
+
+    Returns a "prep" dict for stage 2. Audio is intentionally not kept in
+    memory (stage 2 reloads it)."""
     quiet_third_party_noise()
     import whisperx
-    from whisperx.diarize import DiarizationPipeline
+
+    def phase(name: str) -> None:
+        cb = getattr(args, "phase_callback", None)
+        if cb is not None:
+            try:
+                cb(name)
+            except Exception:
+                pass
 
     t_start = time.monotonic()
     device = pick_device(args)
     lang = None if args.lang in (None, "", "auto") else args.lang
-    print(f"\n=== {path.name} ===")
-    print(f"[info] device={device}  model={args.model}  compute_type={args.compute_type}"
-          f"  batch_size={args.batch_size}" + (f"  language={lang}" if lang else "  language=auto"))
+    prompt = initial_prompt_for(lang)
 
+    print(f"\n=== {path.name} ===")
     size_mb = path.stat().st_size / (1024 * 1024)
     duration = media_duration(path)
     duration_str = hms(duration) if duration else "?"
     print(f"[info] duration: {duration_str} · size: {size_mb:.0f} MB")
+    print(f"[info] device={device}  model={args.model}  compute_type={args.compute_type}"
+          f"  batch_size={args.batch_size}"
+          + (f"  language={lang}" if lang else "  language=auto"))
 
-    # 1. Transcribe (batched faster-whisper)
-    model_path = asr_model_path(args.model)
-    model = whisperx.load_model(
-        str(model_path),
-        device=device,
-        compute_type=args.compute_type,
-        language=lang,
-        asr_options={
-            "initial_prompt": initial_prompt_for(lang),
-        },
-    )
+    phase("load")
+    # The ASR model is loaded once and reused across every file in the batch
+    # (only evicted after transcription so diarization keeps full VRAM).
+    model_key = ("asr", args.model, device, args.compute_type, bool(lang))
+    model = cache.get(model_key)
+    if model is None:
+        model = whisperx.load_model(
+            str(asr_model_path(args.model)),
+            device=device,
+            compute_type=args.compute_type,
+            language=lang,
+            asr_options={"initial_prompt": prompt},
+        )
+        cache.put(model_key, model)
+    else:
+        try:  # keep the language-bias prompt in sync with the current file
+            model.options.initial_prompt = prompt
+        except Exception:
+            pass
+
     audio = whisperx.load_audio(str(path))
     print("[info] Transcribing...")
+    phase("asr")
+
     external_cb = getattr(args, "progress_callback", None)
     printer = progress_printer()
 
@@ -453,55 +812,162 @@ def transcribe_one(path: Path, args) -> dict | None:
             external_cb(pct)
 
     t0 = time.monotonic()
-    result = model.transcribe(
-        audio,
-        batch_size=args.batch_size,
-        language=lang,
-        progress_callback=on_progress,
-    )
-    print(f"[info] Transcription done in {(time.monotonic() - t0) / 60:.1f} min")
+    batch = args.batch_size
+    result = None
+    for attempt in range(3):
+        try:
+            result = model.transcribe(
+                audio,
+                batch_size=batch,
+                language=lang,
+                progress_callback=on_progress,
+            )
+            break
+        except Exception as exc:
+            if _is_cuda_fatal(exc):
+                raise
+            if _is_cuda_oom(exc) and batch > 1 and attempt < 2:
+                batch = max(1, batch // 2)
+                # Drop the possibly-corrupt model instance: reload fresh, it
+                # may have leaked GPU memory or left the device in a bad state.
+                try:
+                    cache.evict(model_key)
+                except Exception:
+                    pass
+                del model
+                free_gpu()
+                model = whisperx.load_model(
+                    str(asr_model_path(args.model)),
+                    device=device,
+                    compute_type=args.compute_type,
+                    language=lang,
+                    asr_options={"initial_prompt": prompt},
+                )
+                cache.put(model_key, model)
+                print(f"[warn] GPU out of memory; retrying with batch_size={batch}"
+                      f" (fresh model load)...")
+            else:
+                raise
+    print(f"[info] Transcription done in {(time.monotonic() - t0) / 60:.1f} min"
+          f" ({result['language']}, {len(result['segments'])} segments)")
+
+    # Evict the ASR model BEFORE alignment/diarization. Its weights live in
+    # CTranslate2-managed VRAM (invisible to torch), so leaving it resident
+    # starves pyannote of memory and makes diarization ~5x slower. The small
+    # alignment and diarization pipelines stay cached across files instead.
+    cache.evict(model_key)
     del model
     free_gpu()
 
-    language = result.get("language", args.lang)
+    language = result.get("language", lang or args.lang)
 
     # 2. Forced alignment (accurate word timestamps)
+    phase("align")
     t0 = time.monotonic()
     try:
-        model_a, metadata = whisperx.load_align_model(language_code=language, device=device)
+        align_key = ("align", language, device)
+        aligned = cache.get(align_key)
+        if aligned is None:
+            aligned = whisperx.load_align_model(language_code=language, device=device)
+            cache.put(align_key, aligned)
+        model_a, metadata = aligned
         result = whisperx.align(
             result["segments"], model_a, metadata, audio, device,
             return_char_alignments=False,
         )
-        del model_a
-        free_gpu()
         print(f"[info] Alignment done in {(time.monotonic() - t0) / 60:.1f} min")
     except Exception as exc:
         print(f"[warn] Alignment failed ({exc}); keeping Whisper timestamps.")
 
-    segments = result["segments"]
+    segments = drop_repeated_segments(result["segments"])
+    # Importantly, write the cleaned segments back into `result` so that
+    # diarization's assign_word_speakers works on the cleaned list (otherwise
+    # it silently resurrects every hallucinated segment that was removed).
+    result["segments"] = segments
+    return {
+        "path": path,
+        "result": result,
+        "segments": segments,
+        "language": language,
+        "t_start": t_start,
+        "device": device,
+        "lang": lang,
+    }
+
+
+def _diarize_write(prep: dict, args, cache: ModelCache) -> dict | None:
+    """Stage 2 of a file: reload audio, diarize (ASR already evicted so it
+    stays fast), name speakers, write all outputs.
+
+    Returns {"clips", "totals", "names"} when diarization ran, else None."""
+    import whisperx
+    from whisperx.diarize import DiarizationPipeline
+
+    path = prep["path"]
+    result = prep["result"]
+    segments = prep["segments"]
+    language = prep["language"]
+    device = prep["device"]
+    lang = prep["lang"]
+
+    def phase(name: str) -> None:
+        cb = getattr(args, "phase_callback", None)
+        if cb is not None:
+            try:
+                cb(name)
+            except Exception:
+                pass
+
+    audio = whisperx.load_audio(str(path))
+
+    def phase(name: str) -> None:
+        cb = getattr(args, "phase_callback", None)
+        if cb is not None:
+            try:
+                cb(name)
+            except Exception:
+                pass
+
+    diar_progress = getattr(args, "diarize_progress_callback", None)
 
     # 3. Speaker diarization (optional)
+    phase("diarize")
     diarized = False
     if not args.no_diarize:
         token = resolve_token(args)
         if token:
-            try:
-                print("[info] Running speaker diarization...")
-                t0 = time.monotonic()
-                diarize_model_path = ensure_model(DIARIZE_MODEL_REPO, "speaker-diarization-community-1", marker="config.yaml")
-                dia = DiarizationPipeline(model_name=str(diarize_model_path), token=token, device=device)
-                diarize_segments = dia(audio)
-                del dia
-                free_gpu()
-                result = whisperx.assign_word_speakers(diarize_segments, result)
-                segments = result["segments"]
-                diarized = True
-                speakers = sorted({sp for sp in (s.get("speaker") for s in segments) if sp})
-                print(f"[info] Diarization done in {(time.monotonic() - t0) / 60:.1f} min"
-                      f" — {len(speakers)} speaker(s): {', '.join(speakers)}")
-            except Exception as exc:
-                print(f"[warn] Diarization failed ({exc}); transcript is without speaker labels.")
+            t0 = time.monotonic()
+            print("[info] Running speaker diarization...")
+            for attempt in range(2):
+                try:
+                    dia = cache.get("diarize")
+                    if dia is None:
+                        diarize_model_path = ensure_model(
+                            DIARIZE_MODEL_REPO, "speaker-diarization-community-1",
+                            marker="config.yaml",
+                        )
+                        dia = DiarizationPipeline(
+                            model_name=str(diarize_model_path), token=token, device=device
+                        )
+                        cache.put("diarize", dia)
+                    diarize_segments = dia(audio, progress_callback=diar_progress)
+                    result = whisperx.assign_word_speakers(diarize_segments, result)
+                    segments = result["segments"]
+                    diarized = True
+                    speakers = sorted({s.get("speaker") for s in segments if s.get("speaker")})
+                    print(f"[info] Diarization done in {(time.monotonic() - t0) / 60:.1f} min"
+                          f" — {len(speakers)} speaker(s): {', '.join(speakers)}")
+                    break
+                except Exception as exc:
+                    asr_key = ("asr", args.model, device, args.compute_type, bool(lang))
+                    if _is_cuda_oom(exc) and cache.evict(asr_key) and attempt == 0:
+                        free_gpu()
+                        print("[warn] GPU out of memory during diarization;"
+                              " freed the ASR model and retrying...")
+                    else:
+                        print(f"[warn] Diarization failed ({exc});"
+                              " transcript is without speaker labels.")
+                        break
         else:
             print(
                 "[warn] No Hugging Face token found -> skipping speaker labels.\n"
@@ -513,20 +979,24 @@ def transcribe_one(path: Path, args) -> dict | None:
 
     # 3.5 Speaker naming: auto main speaker + voice clips
     names: dict = {}
-    clips = None
+    payload = None
     if diarized:
+        totals = speaker_totals(segments)
         if getattr(args, "auto_speaker", False):
             dom, dom_secs = dominant_speaker(segments)
-            label = args.speaker_name or "Speaker 1"
+            label = getattr(args, "speaker_name", None) or "Profesor"
             if dom:
                 names[dom] = label
-                print(f"[info] Main speaker: {dom} ({dom_secs / 60:.1f} min hablados) -> '{label}'")
+                print(f"[info] Main speaker: {dom} ({dom_secs / 60:.1f} min spoken) -> '{label}'")
         clip_dir = getattr(args, "speaker_clips_dir", None)
+        clips = {}
         if clip_dir:
             clips = extract_speaker_clips(audio, segments, clip_dir)
+        payload = {"clips": clips, "totals": totals, "names": dict(names), "outputs": []}
 
     # 4. Write outputs — one folder per transcription, named after the source
     #    file, saved next to the original video (or inside --out if given)
+    phase("save")
     stem = path.stem
     base = Path(args.out) if args.out else path.parent
     out_dir = base / stem
@@ -539,27 +1009,136 @@ def transcribe_one(path: Path, args) -> dict | None:
         "device": device,
     }
     wanted = [f.strip() for f in args.formats.split(",") if f.strip()]
+    written: list[str] = []
 
     if "markdown" in wanted:
         md_path = out_dir / f"{stem}.md"
         write_markdown(md_path, title, str(path), meta, segments, names)
+        written.append(str(md_path))
         print(f"[ok] {md_path}")
     if "srt" in wanted:
         srt_path = out_dir / f"{stem}.srt"
         write_srt(srt_path, segments, names)
+        written.append(str(srt_path))
         print(f"[ok] {srt_path}")
     if "vtt" in wanted:
         vtt_path = out_dir / f"{stem}.vtt"
         write_vtt(vtt_path, segments, names)
+        written.append(str(vtt_path))
         print(f"[ok] {vtt_path}")
+    if "txt" in wanted:
+        txt_path = out_dir / f"{stem}.txt"
+        write_txt(txt_path, title, meta, segments, names)
+        written.append(str(txt_path))
+        print(f"[ok] {txt_path}")
     if "json" in wanted:
         json_path = out_dir / f"{stem}.json"
         write_json(json_path, result)
+        written.append(str(json_path))
         print(f"[ok] {json_path}")
 
-    print(f"[info] Total: {(time.monotonic() - t_start) / 60:.1f} min")
+    print(f"[info] Total: {(time.monotonic() - prep['t_start']) / 60:.1f} min")
 
-    return clips
+    if payload:
+        payload["outputs"] = written
+
+    return payload
+
+
+def transcribe_one(path: Path, args, cache: ModelCache | None = None) -> dict | None:
+    """Transcribe a single file end-to-end (stage 1 + stage 2)."""
+    cache = cache if cache is not None else ModelCache()
+    prep = _transcribe_align(path, args, cache)
+    return _diarize_write(prep, args, cache)
+
+
+# --------------------------------------------------------------------------- #
+# Checkpoint / resume: stage 1 results are saved so an interrupted batch only
+# redoes diarization, never transcription.
+# --------------------------------------------------------------------------- #
+
+CHECK_SUFFIX = ".aligned.json"
+
+
+def _checkpoint_path(path: Path, args) -> Path:
+    stem = path.stem
+    base = Path(args.out) if args.out else path.parent
+    return base / stem / f"{stem}{CHECK_SUFFIX}"
+
+
+def _save_checkpoint(prep: dict, args) -> None:
+    try:
+        path = _checkpoint_path(prep["path"], args)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        data = {"language": prep["language"], "result": prep["result"],
+                "segments": prep["segments"]}
+        _write_text(path, json.dumps(data, ensure_ascii=False))
+    except Exception as exc:
+        print(f"[warn] Could not save checkpoint: {exc}")
+
+
+def _load_checkpoint(path: Path, args) -> dict | None:
+    cp = _checkpoint_path(path, args)
+    if not cp.exists():
+        return None
+    try:
+        data = json.loads(cp.read_text(encoding="utf-8"))
+        segments = data["segments"]
+        result = data["result"]
+        result["segments"] = segments
+        print(f"[info] Resumed aligned transcription from checkpoint: {cp}")
+        return {
+            "path": Path(path),
+            "result": result,
+            "segments": segments,
+            "language": data.get("language", "?"),
+            "t_start": time.monotonic(),
+            "device": pick_device(args),
+            "lang": None if args.lang in (None, "", "auto") else args.lang,
+        }
+    except Exception as exc:
+        print(f"[warn] Could not load checkpoint ({exc}); transcribing from scratch.")
+        return None
+
+
+def get_prep(path: Path, args, cache: ModelCache, no_resume: bool = False) -> dict:
+    """Stage 1 with resume: reuse the checkpoint if present, otherwise
+    transcribe+align and save a checkpoint."""
+    prep = None if no_resume else _load_checkpoint(path, args)
+    if prep is None:
+        prep = _transcribe_align(path, args, cache)
+        _save_checkpoint(prep, args)
+    return prep
+
+
+def transcribe_batch(files: list[Path], args, cache: ModelCache | None = None) -> None:
+    """Transcribe many files in two passes: transcribe+align everything first
+    (the ASR model loads once for the whole batch), then diarize+write
+    everything (the ASR model is gone, so diarization keeps full VRAM)."""
+    cache = cache if cache is not None else ModelCache()
+    no_resume = bool(getattr(args, "no_resume", False))
+    prepared: list[dict] = []
+    for f in files:
+        try:
+            prepared.append(get_prep(f, args, cache, no_resume))
+        except Exception as exc:
+            print(f"[error] Failed on {f}: {exc}", file=sys.stderr)
+            traceback.print_exc(file=sys.stderr)
+            if _is_cuda_fatal(exc):
+                print("[error] The GPU was lost (out of memory or another GPU app)."
+                      " The remaining files were skipped — close other GPU-heavy"
+                      " apps and re-run.", file=sys.stderr)
+                break
+    for prep in prepared:
+        try:
+            _diarize_write(prep, args, cache)
+        except Exception as exc:
+            print(f"[error] Failed on {prep['path']}: {exc}", file=sys.stderr)
+            traceback.print_exc(file=sys.stderr)
+
+
+# Thin note: heavy imports (whisperx, pyannote) live inside transcribe_one so
+# they run after the warning filters are registered.
 
 
 def collect_inputs(paths: list[str]) -> list[Path]:
@@ -587,15 +1166,17 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--compute-type", default="int8",
                    help="Quantization for ASR (default: int8; float16 if you have VRAM)")
     p.add_argument("--batch-size", type=int, default=8,
-                   help="ASR batch size (default: 8; lower if GPU out of memory)")
+                   help="ASR batch size (default: 8; auto-retries with half on OOM)")
     p.add_argument("--formats", default="markdown,srt",
-                   help="Comma list of outputs: markdown,srt,vtt,json (default: markdown,srt)")
+                   help="Comma list of outputs: markdown,srt,vtt,txt,json (default: markdown,srt)")
     p.add_argument("--out", default=None,
                    help="Base output directory (default: next to each input video; "
                         "a subfolder named after the video is always created)")
     p.add_argument("--title", default=None, help="Optional title used in the Markdown header")
     p.add_argument("--no-diarize", action="store_true",
                    help="Skip speaker diarization entirely")
+    p.add_argument("--no-resume", action="store_true",
+                   help="Ignore saved checkpoints; transcribe from scratch")
     p.add_argument("--auto-speaker", action="store_true",
                    help="Assign --speaker-name to the speaker with the most speaking time")
     p.add_argument("--speaker-name", default="Profesor",
@@ -634,15 +1215,19 @@ def main(argv=None) -> int:
         print("[error] No media files found in the given inputs.", file=sys.stderr)
         return 2
 
-    ensure_punkt()
+    log_path = new_log_path()
+    with open(log_path, "w", encoding="utf-8") as log_file:
+        sys.stdout = Tee(sys.stdout, log_file)
+        sys.stderr = Tee(sys.stderr, log_file)
 
-    for f in files:
-        try:
-            transcribe_one(f, args)
-        except Exception as exc:
-            print(f"[error] Failed on {f}: {exc}", file=sys.stderr)
-            import traceback
-            traceback.print_exc(file=sys.stderr)
+        ensure_punkt()
+
+        t_run = time.monotonic()
+        print(f"=== Run started: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===")
+        transcribe_batch(files, args)
+        print(f"=== Run completed: {len(files)} file(s) in "
+              f"{(time.monotonic() - t_run) / 60:.1f} min ===")
+        print(f"=== Log saved to: {log_path} ===")
 
     print("\nDone.")
     return 0

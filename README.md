@@ -26,9 +26,13 @@ Built on [WhisperX](https://github.com/m-bain/whisperX) — faster-whisper for s
 - GPU-accelerated with CUDA (falls back to CPU), quantized int8 to fit low-VRAM cards
 - Speaker diarization: each voice becomes `SPEAKER_00`, `SPEAKER_01`, ...
 - Configurable main speaker: assign a label to the most-spoken speaker automatically, or mark it manually by listening to a short audio sample of each voice
+- Name every voice and merge duplicated ones: two speakers given the same label become one person
+- Hallucination guard: collapses repeated-word loops and drops repeated segments
+- Alignment and diarization models are reused across files; the ASR model is unloaded before diarization so it stays fast on low-VRAM cards
+- Graceful GPU-out-of-memory recovery (halves the batch size and retries)
 - Bilingual-friendly: Spanish by default, with a prompt that keeps English technical terms intact
 - One output folder per video, saved next to the original recording
-- Drag-and-drop GUI (`gui.py`) and a full CLI (`transcribe.py`)
+- Drag-and-drop GUI (`gui.py`) with a clean dark theme and purple accents, dark title bar, live progress bar, phase feedback, stop control, and persistent settings; plus a full CLI (`transcribe.py`)
 
 ## Requirements
 
@@ -87,10 +91,11 @@ uv run transcribe.py video.mp4 --lang es --auto-speaker --speaker-name Profesor
 |---|---|---|
 | `--lang` | `es` | Language code (`es`, `en`, `auto`, ...) |
 | `--model` | `large-v3-turbo` | Whisper model; `medium` if low on VRAM |
-| `--formats` | `markdown,srt` | Comma list: `markdown,srt,vtt,json` |
-| `--batch-size` | `8` | Lower if the GPU runs out of memory |
+| `--formats` | `markdown,srt` | Comma list: `markdown,srt,vtt,txt,json` |
+| `--batch-size` | `8` | Lower if the GPU runs out of memory (auto-retries with half) |
 | `--out` | next to video | Base output directory (one subfolder per video) |
 | `--no-diarize` | off | Skip speaker labels |
+| `--no-resume` | off | Ignore saved checkpoints; transcribe from scratch |
 | `--auto-speaker` | off | Assign `--speaker-name` to the most-spoken speaker |
 | `--speaker-name` | `Profesor` | Label for the main speaker |
 | `--speaker-clips DIR` | — | Save a short WAV per speaker to listen to the voices |
@@ -105,23 +110,28 @@ media\
 └── recording-2026-07-28\
     ├── recording-2026-07-28.md
     ├── recording-2026-07-28.srt
-    └── recording-2026-07-28.vtt
+    ├── recording-2026-07-28.vtt
+    └── recording-2026-07-28.txt
 ```
 
-Subtitles are merged into sentence-sized lines. Load the `.srt` in VLC alongside the recording to verify the transcript against the audio.
+Subtitles are built as broadcast-style cues: at most two lines of ~44 characters, ~5 seconds each — long sentences are split automatically. Load the `.srt` in VLC alongside the recording to verify the transcript against the audio.
 
 ## Speaker identification
 
 Diarization clusters voices automatically; it never needs to know how many speakers there are. Two ways to label the main speaker (e.g. the teacher in a class, the host in a meeting):
 
 - **Automatic:** `--auto-speaker` assigns `--speaker-name` (default `Profesor`) to the speaker with the most speaking time.
-- **Manual:** with auto off, the GUI plays a short audio sample of each voice so you can mark the right one by ear.
+- **Manual:** with auto off, after each run the GUI lets you review **each file of a batch individually** — every detected voice shows its speaking time and **several audio samples**, so you can name them by ear.
+
+You can also name every voice, not just the main one — and two voices given the same name are merged into one person, which fixes the common case where diarization splits a single speaker in two. The GUI keeps these settings between sessions.
 
 ## Performance
 
 Measured on a GTX 1650 SUPER (4GB) with `large-v3-turbo` + int8: roughly **3 minutes of ASR per hour of audio**, plus a few minutes for alignment and diarization.
 
 First run downloads the ASR model (~1.6GB) and the diarization pipeline (~100MB) into `models/`; afterwards everything is cached.
+
+Transcriptions are checkpointed: after aligning, each file saves a `<name>.aligned.json` next to its outputs. If a run is interrupted or you re-run the same files, transcription is skipped and only diarization runs — a crashed batch resumes in minutes, not hours. Delete the `.aligned.json` files (or pass `--no-resume`) to force a fresh transcription.
 
 ## Project structure
 
