@@ -96,6 +96,7 @@ uv run transcribe.py video.mp4 --lang es --auto-speaker --speaker-name Profesor
 | `--out` | next to video | Base output directory (one subfolder per video) |
 | `--no-diarize` | off | Skip speaker labels |
 | `--no-resume` | off | Ignore saved checkpoints; transcribe from scratch |
+| `--benchmark` | off | Measure this machine's speed (bundled sample), save to `perf.json`, exit |
 | `--auto-speaker` | off | Assign `--speaker-name` to the most-spoken speaker |
 | `--speaker-name` | `Profesor` | Label for the main speaker |
 | `--speaker-clips DIR` | — | Save a short WAV per speaker to listen to the voices |
@@ -132,6 +133,8 @@ Measured on a GTX 1650 SUPER (4GB) with `large-v3-turbo` + int8: roughly **3 min
 First run downloads the ASR model (~1.6GB) and the diarization pipeline (~100MB) into `models/`; afterwards everything is cached.
 
 Transcriptions are checkpointed: after aligning, each file saves a `<name>.aligned.json` next to its outputs. If a run is interrupted or you re-run the same files, transcription is skipped and only diarization runs — a crashed batch resumes in minutes, not hours. Delete the `.aligned.json` files (or pass `--no-resume`) to force a fresh transcription.
+
+Speed estimates self-calibrate: every run records its measured rates, and --benchmark (or the GUI's Probar velocidad button) measures your machine with a bundled sample. The pre-flight dialog shows a time range and warns when the GPU is shared with heavy apps. Calibration lives in %LOCALAPPDATA%\video-transcriber\perf.json (machine-local, not committed).
 
 ## Project structure
 

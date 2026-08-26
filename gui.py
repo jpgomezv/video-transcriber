@@ -247,6 +247,10 @@ class App(TkinterDnD.Tk):
         self.btn_log = ttk.Button(btn_row, text="Abrir registro", command=self.open_log,
                                   bootstyle="secondary-outline", state="disabled")
         self.btn_log.pack(side="left", padx=6)
+        self.btn_bench = ttk.Button(btn_row, text="Probar velocidad",
+                                    command=self.run_benchmark,
+                                    bootstyle="secondary-outline")
+        self.btn_bench.pack(side="left")
         self.status = ttk.Label(
             frm_run,
             text="Listo. Arrastra tus grabaciones, elige opciones y pulsa Transcribir.\n"
@@ -436,6 +440,37 @@ class App(TkinterDnD.Tk):
         if self.last_log_path and Path(self.last_log_path).exists() and hasattr(os, "startfile"):
             os.startfile(str(self.last_log_path))
 
+    def run_benchmark(self):
+        if self.running:
+            messagebox.showinfo("En proceso",
+                                "Espera a que termine la transcripción actual.")
+            return
+        if shutil.which("ffmpeg") is None:
+            messagebox.showerror(
+                "ffmpeg no encontrado",
+                "Instala ffmpeg (winget install Gyan.FFmpeg) y abre una terminal nueva.")
+            return
+        messagebox.showinfo(
+            "Prueba de velocidad",
+            "Mido tu velocidad real con la muestra incluida (~1 min, carga el modelo).\n"
+            "Cierra apps con GPU para un resultado realista.")
+        self.btn_bench.config(state="disabled")
+        threading.Thread(target=self._bench_worker, daemon=True).start()
+
+    def _bench_worker(self):
+        q = self.queue
+        redirect = StreamRedirect(q)
+        old_out, old_err = sys.stdout, sys.stderr
+        sys.stdout = sys.stderr = redirect
+        try:
+            q.put(("status", "Midiendo velocidad..."))
+            result = transcribe.run_benchmark(self._build_args())
+            q.put(("bench_result", result or {}))
+        except Exception:
+            q.put("\n" + traceback.format_exc() + "\n")
+        finally:
+            sys.stdout, sys.stderr = old_out, old_err
+
     def start(self):
         if self.running:
             return
@@ -450,9 +485,12 @@ class App(TkinterDnD.Tk):
             )
             return
         args = self._build_args()
-        est = transcribe.estimate_runtime(files, diarize=not args.no_diarize)
+        device = transcribe.pick_device(args)
+        low, high, calibrated = transcribe.estimate_runtime(
+            files, args, device, diarize=not args.no_diarize)
+        mark = "calibrado a esta máquina" if calibrated else "estimación por tipo de GPU"
         gpu = transcribe.gpu_status()
-        lines = [f"Tiempo estimado: ~{est:.0f} min"]
+        lines = [f"Tiempo estimado: ~{low:.0f}-{high:.0f} min  ({mark})"]
         if transcribe.gpu_is_busy(gpu):
             lines.append(
                 f"La GPU está ocupada: {gpu['util']:.0f}% de uso, "
@@ -538,6 +576,22 @@ class App(TkinterDnD.Tk):
                     q.put(f"\n>>> Completado: {Path(prep['path']).name}\n")
                 except Exception:
                     q.put("\n" + traceback.format_exc() + "\n")
+            # Record measured rates for better estimates on this machine.
+            try:
+                asr = [p["measure"]["asr_rate"] for p in prepared
+                       if p.get("measure") and p["measure"].get("asr_rate") is not None]
+                align = [p["measure"]["align_rate"] for p in prepared
+                         if p.get("measure") and p["measure"].get("align_rate") is not None]
+                diar = [p["diarize_rate"] for p in prepared if p.get("diarize_rate")]
+                if asr or align or diar:
+                    transcribe.record_rates(
+                        args, transcribe.pick_device(args),
+                        asr_rate=sum(asr) / len(asr) if asr else None,
+                        align_rate=sum(align) / len(align) if align else None,
+                        diarize_rate=sum(diar) / len(diar) if diar else None,
+                    )
+            except Exception:
+                pass
         finally:
             sys.stdout, sys.stderr = old_out, old_err
             try:
@@ -561,6 +615,20 @@ class App(TkinterDnD.Tk):
                     elif kind == "diar_progress":
                         self.progress.config(mode="determinate", value=rest[0])
                         self.status.config(text=f"Identificando hablantes… {rest[0]:.0f}%")
+                    elif kind == "bench_result":
+                        r = rest[0]
+                        self.btn_bench.config(state="normal")
+                        self.status.config(text="Listo.")
+                        lines = ["Velocidades medidas (segundos por minuto de audio):"]
+                        lines.append(f"  ASR:        {r.get('asr_rate', 0) * 60:.1f} s/min")
+                        lines.append(f"  Alineación: {r.get('align_rate', 0) * 60:.1f} s/min")
+                        if r.get("diarize_rate"):
+                            lines.append(f"  Diarización:{r['diarize_rate'] * 60:.1f} s/min")
+                        else:
+                            lines.append("  Diarización: (sin token o deshabilitada)")
+                        lines.append("")
+                        lines.append("Guardado. Las próximas estimaciones usarán estos valores.")
+                        messagebox.showinfo("Prueba de velocidad", "\n".join(lines))
                     elif kind == "status":
                         self.status.config(text=rest[0])
                     elif kind == "phase":

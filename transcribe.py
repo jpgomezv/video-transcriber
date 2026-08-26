@@ -29,6 +29,7 @@ import argparse
 import gc
 import json
 import os
+import statistics
 import subprocess
 import sys
 import time
@@ -544,23 +545,123 @@ def free_gpu() -> None:
         torch.cuda.empty_cache()
 
 
-# Measured on the GTX 1650 SUPER: minutes of wall-clock per minute of audio.
+# Baseline rates measured on a GTX 1650 SUPER: minutes of wall-clock per
+# minute of audio. Real machines self-calibrate via perf.json (recorded from
+# runs / benchmark); these are the fallback when nothing is calibrated yet.
 RATE_ASR = 0.060
 RATE_ALIGN = 0.022
 RATE_DIARIZE = 0.065
 PER_FILE_OVERHEAD = 0.35  # model loads, VAD, I/O
+RATE_MARGIN_CALIBRATED = 0.15
+RATE_MARGIN_ESTIMATED = 0.40
+
+PERF_FILE = APP_DATA_DIR / "perf.json"
+BENCH_SAMPLE = "sample.wav"
+BENCH_SAMPLE_PATH = Path(__file__).resolve().parent / "assets" / BENCH_SAMPLE
 
 
-def estimate_runtime(files, diarize: bool = True) -> float:
-    """Rough total wall-clock estimate in minutes for the given files."""
+# --------------------------------------------------------------------------- #
+# Speed calibration (per-machine): perf.json + heuristic fallback
+# --------------------------------------------------------------------------- #
+
+def _perf_key(args, device: str) -> str:
+    return f"{device}|{getattr(args, 'model', 'large-v3-turbo')}|{getattr(args, 'compute_type', 'int8')}"
+
+
+def load_perf() -> dict:
+    try:
+        return json.loads(PERF_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def save_perf(perf: dict) -> None:
+    try:
+        APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
+        PERF_FILE.write_text(json.dumps(perf, ensure_ascii=False, indent=2),
+                             encoding="utf-8")
+    except Exception:
+        pass
+
+
+def record_rates(args, device: str, asr_rate=None, align_rate=None,
+                 diarize_rate=None, benchmark: bool = False) -> None:
+    """Store measured rates for this machine. Real runs use an EWMA so a
+    single contended run can't poison the estimate; benchmarks overwrite."""
+    perf = load_perf()
+    key = _perf_key(args, device)
+    entry = perf.setdefault(key, {"samples": 0, "asr_rate": None,
+                                  "align_rate": None, "diarize_rate": None})
+    if benchmark:
+        for field, val in (("asr_rate", asr_rate), ("align_rate", align_rate),
+                           ("diarize_rate", diarize_rate)):
+            if val is not None and val > 0:
+                entry[field] = val
+        entry["samples"] = 1
+    else:
+        got = False
+        for field, val in (("asr_rate", asr_rate), ("align_rate", align_rate),
+                           ("diarize_rate", diarize_rate)):
+            if val is not None and val > 0:
+                prev = entry.get(field)
+                entry[field] = prev * 0.7 + val * 0.3 if prev else val
+                got = True
+        if got:
+            entry["samples"] = entry.get("samples", 0) + 1
+    entry["measured_at"] = datetime.date.today().isoformat()
+    save_perf(perf)
+
+
+def backfill_perf_from_logs() -> None:
+    """Stub (intentionally unused): old logs describe runs slowed by GPU
+    contention, so they cannot calibrate a clean estimate. The benchmark and
+    EWMA from live runs are the honest source."""
+    return
+
+
+def _gpu_name() -> str:
+    try:
+        out = subprocess.run(["nvidia-smi", "--query-gpu=name",
+                              "--format=csv,noheader"],
+                             capture_output=True, text=True, timeout=10).stdout
+        return out.strip().splitlines()[0] if out.strip() else ""
+    except Exception:
+        return ""
+
+
+def heuristic_rates(device: str) -> dict:
+    """Coarse rates when this machine has no calibration yet."""
+    base = {"asr_rate": RATE_ASR, "align_rate": RATE_ALIGN,
+            "diarize_rate": RATE_DIARIZE}
+    if device != "cuda":
+        return {k: v * 8 for k, v in base.items()}
+    name = _gpu_name().lower()
+    scale = 1.0
+    if any(t in name for t in ("rtx 3", "rtx 40", "rtx 5", "rtx 50")):
+        scale = 2.5
+    elif "rtx 20" in name:
+        scale = 1.3
+    return {k: v / scale for k, v in base.items()}
+
+
+def estimate_runtime(files, args, device: str, diarize: bool = True):
+    """(low_min, high_min, calibrated) estimate for the given files."""
+    perf = load_perf()
+    entry = perf.get(_perf_key(args, device))
+    calibrated = bool(entry and entry.get("asr_rate") and entry.get("align_rate")
+                      and entry.get("diarize_rate"))
+    rates = {k: entry[k] for k in ("asr_rate", "align_rate", "diarize_rate")} \
+        if calibrated else heuristic_rates(device)
+
     total = 0.0
     for f in files:
         duration = media_duration(Path(f)) or 0.0
         mins = duration / 60.0
-        total += mins * RATE_ASR + mins * RATE_ALIGN + PER_FILE_OVERHEAD
+        total += mins * rates["asr_rate"] + mins * rates["align_rate"] + PER_FILE_OVERHEAD
         if diarize:
-            total += mins * RATE_DIARIZE
-    return total
+            total += mins * rates["diarize_rate"]
+    margin = RATE_MARGIN_CALIBRATED if calibrated else RATE_MARGIN_ESTIMATED
+    return total * (1 - margin), total * (1 + margin), calibrated
 
 
 def gpu_status() -> dict | None:
@@ -832,7 +933,7 @@ def _transcribe_align(path: Path, args, cache: ModelCache) -> dict:
 
     # 2. Forced alignment (accurate word timestamps)
     phase("align")
-    t0 = time.monotonic()
+    t_align = time.monotonic()
     try:
         align_key = ("align", language, device)
         aligned = cache.get(align_key)
@@ -844,7 +945,7 @@ def _transcribe_align(path: Path, args, cache: ModelCache) -> dict:
             result["segments"], model_a, metadata, audio, device,
             return_char_alignments=False,
         )
-        print(f"[info] Alignment done in {(time.monotonic() - t0) / 60:.1f} min")
+        print(f"[info] Alignment done in {(time.monotonic() - t_align) / 60:.1f} min")
     except Exception as exc:
         print(f"[warn] Alignment failed ({exc}); keeping Whisper timestamps.")
 
@@ -853,6 +954,15 @@ def _transcribe_align(path: Path, args, cache: ModelCache) -> dict:
     # diarization's assign_word_speakers works on the cleaned list (otherwise
     # it silently resurrects every hallucinated segment that was removed).
     result["segments"] = segments
+
+    audio_minutes = len(audio) / 16000 / 60
+    measure = {}
+    if audio_minutes > 0:
+        measure["asr_rate"] = (time.monotonic() - t0) / 60 / audio_minutes
+        try:
+            measure["align_rate"] = (time.monotonic() - t_align) / 60 / audio_minutes
+        except (UnboundLocalError, NameError):
+            measure["align_rate"] = None
     return {
         "path": path,
         "result": result,
@@ -861,6 +971,7 @@ def _transcribe_align(path: Path, args, cache: ModelCache) -> dict:
         "t_start": t_start,
         "device": device,
         "lang": lang,
+        "measure": measure,
     }
 
 
@@ -923,6 +1034,9 @@ def _diarize_write(prep: dict, args, cache: ModelCache) -> dict | None:
                     result = whisperx.assign_word_speakers(diarize_segments, result)
                     segments = result["segments"]
                     diarized = True
+                    _audio_min = len(audio) / 16000 / 60
+                    if _audio_min > 0:
+                        prep["diarize_rate"] = (time.monotonic() - t0) / 60 / _audio_min
                     speakers = sorted({s.get("speaker") for s in segments if s.get("speaker")})
                     print(f"[info] Diarization done in {(time.monotonic() - t0) / 60:.1f} min"
                           f" — {len(speakers)} speaker(s): {', '.join(speakers)}")
@@ -1021,6 +1135,83 @@ def transcribe_one(path: Path, args, cache: ModelCache | None = None) -> dict | 
     return _diarize_write(prep, args, cache)
 
 
+def run_benchmark(args) -> dict | None:
+    """Measure ASR/alignment/diarization rates on the bundled sample and store
+    them in perf.json. One-time ~1 min, including model loads."""
+    quiet_third_party_noise()
+    import whisperx
+    from whisperx.diarize import DiarizationPipeline
+
+    device = pick_device(args)
+    lang = None if args.lang in (None, "", "auto") else args.lang
+
+    if not BENCH_SAMPLE_PATH.exists():
+        print(f"[error] Benchmark sample not found: {BENCH_SAMPLE_PATH}")
+        return None
+
+    audio = whisperx.load_audio(str(BENCH_SAMPLE_PATH))
+    audio_minutes = len(audio) / 16000 / 60
+    print(f"[info] Benchmarking on {audio_minutes:.1f} min of speech "
+          f"(model={args.model}, {args.compute_type})...")
+
+    # ASR
+    model = whisperx.load_model(
+        str(asr_model_path(args.model)), device=device,
+        compute_type=args.compute_type, language=lang,
+        asr_options={"initial_prompt": initial_prompt_for(lang)},
+    )
+    t0 = time.monotonic()
+    model.transcribe(audio, batch_size=args.batch_size, language=lang)
+    asr_rate = (time.monotonic() - t0) / 60 / audio_minutes
+    print(f"[info] ASR rate: {asr_rate * 60:.1f} s per minute of audio")
+    del model
+    free_gpu()
+
+    # Alignment
+    align_rate = RATE_ALIGN
+    t0 = time.monotonic()
+    try:
+        model_a, metadata = whisperx.load_align_model(language_code="es", device=device)
+        aligned = whisperx.align(  # noqa: F841
+            [], model_a, metadata, audio, device, return_char_alignments=False,
+        )
+        align_rate = (time.monotonic() - t0) / 60 / audio_minutes
+    except Exception:
+        pass
+    try:
+        del model_a
+    except Exception:
+        pass
+    free_gpu()
+    print(f"[info] Alignment rate: {align_rate * 60:.1f} s per minute of audio")
+
+    # Diarization
+    diar_rate = None
+    if not args.no_diarize:
+        token = resolve_token(args)
+        if token:
+            dia = DiarizationPipeline(
+                model_name=str(ensure_model(
+                    DIARIZE_MODEL_REPO, "speaker-diarization-community-1",
+                    marker="config.yaml")),
+                token=token, device=device,
+            )
+            t0 = time.monotonic()
+            dia(audio)
+            diar_rate = (time.monotonic() - t0) / 60 / audio_minutes
+            print(f"[info] Diarization rate: {diar_rate * 60:.1f} s per minute of audio")
+            del dia
+            free_gpu()
+        else:
+            print("[warn] No HF token; diarization rate not measured")
+    else:
+        print("[info] Diarization disabled; rate not measured")
+
+    record_rates(args, device, asr_rate=asr_rate, align_rate=align_rate,
+                 diarize_rate=diar_rate, benchmark=True)
+    return {"asr_rate": asr_rate, "align_rate": align_rate, "diarize_rate": diar_rate}
+
+
 # --------------------------------------------------------------------------- #
 # Checkpoint / resume: stage 1 results are saved so an interrupted batch only
 # redoes diarization, never transcription.
@@ -1105,6 +1296,23 @@ def transcribe_batch(files: list[Path], args, cache: ModelCache | None = None) -
             print(f"[error] Failed on {prep['path']}: {exc}", file=sys.stderr)
             traceback.print_exc(file=sys.stderr)
 
+    # Record measured rates so the next estimate is calibrated to this machine.
+    try:
+        asr = [p["measure"]["asr_rate"] for p in prepared
+               if p.get("measure") and p["measure"].get("asr_rate") is not None]
+        align = [p["measure"]["align_rate"] for p in prepared
+                 if p.get("measure") and p["measure"].get("align_rate") is not None]
+        diar = [p["diarize_rate"] for p in prepared if p.get("diarize_rate")]
+        if asr or align or diar:
+            record_rates(
+                args, pick_device(args),
+                asr_rate=statistics.fmean(asr) if asr else None,
+                align_rate=statistics.fmean(align) if align else None,
+                diarize_rate=statistics.fmean(diar) if diar else None,
+            )
+    except Exception:
+        pass
+
 
 # Thin note: heavy imports (whisperx, pyannote) live inside transcribe_one so
 # they run after the warning filters are registered.
@@ -1128,7 +1336,10 @@ def parse_args(argv=None) -> argparse.Namespace:
         prog="transcribe.py",
         description="Transcribe video/audio locally with WhisperX (free, no uploads).",
     )
-    p.add_argument("inputs", nargs="+", help="Video/audio file(s), or folder(s) of them")
+    p.add_argument("inputs", nargs="*", help="Video/audio file(s), or folder(s) of them")
+    p.add_argument("--benchmark", action="store_true",
+                   help="Measure speeds on this machine with the bundled sample, "
+                        "save to perf.json and exit")
     p.add_argument("--lang", default="es", help="Language code (default: es)")
     p.add_argument("--model", default="large-v3-turbo",
                    help="Whisper model (default: large-v3-turbo; try medium if low VRAM)")
@@ -1179,6 +1390,12 @@ def main(argv=None) -> int:
         )
         return 2
 
+    if args.benchmark:
+        result = run_benchmark(args)
+        if result is None:
+            return 2
+        return 0
+
     files = collect_inputs(args.inputs)
     if not files:
         print("[error] No media files found in the given inputs.", file=sys.stderr)
@@ -1191,10 +1408,13 @@ def main(argv=None) -> int:
 
         ensure_punkt()
 
-        est = estimate_runtime(files, diarize=not args.no_diarize)
+        device = pick_device(args)
+        low, high, calibrated = estimate_runtime(
+            files, args, device, diarize=not args.no_diarize)
         gpu = gpu_status()
-        print(f"[info] Estimated runtime: ~{est:.0f} min for {len(files)} file(s)"
-              f" (diarization {'on' if not args.no_diarize else 'off'})")
+        tag = " (calibrated to this machine)" if calibrated else " (estimate, based on GPU type)"
+        print(f"[info] Estimated runtime: ~{low:.0f}-{high:.0f} min for {len(files)} file(s)"
+              f" (diarization {'on' if not args.no_diarize else 'off'}){tag}")
         if gpu_is_busy(gpu):
             seen = sorted({a.strip() for a in gpu["apps"]})
             print(f"[warn] GPU is busy: {gpu['util']:.0f}% util, "
