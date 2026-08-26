@@ -932,6 +932,10 @@ def _transcribe_align(path: Path, args, cache: ModelCache) -> dict:
     language = result.get("language", lang or args.lang)
 
     # 2. Forced alignment (accurate word timestamps)
+    # NOTE: the alignment model is used and then evicted immediately. On a
+    # low-VRAM card, keeping it cached across files while the ASR model loads
+    # leaves the GPU nearly full (alignment + ASR + browser/Windows) and makes
+    # ASR ~2x slower due to fragmentation. Reloading 360MB per file is cheap.
     phase("align")
     t_align = time.monotonic()
     try:
@@ -945,6 +949,9 @@ def _transcribe_align(path: Path, args, cache: ModelCache) -> dict:
             result["segments"], model_a, metadata, audio, device,
             return_char_alignments=False,
         )
+        cache.evict(align_key)
+        del model_a
+        free_gpu()
         print(f"[info] Alignment done in {(time.monotonic() - t_align) / 60:.1f} min")
     except Exception as exc:
         print(f"[warn] Alignment failed ({exc}); keeping Whisper timestamps.")
