@@ -450,6 +450,23 @@ class App(TkinterDnD.Tk):
             )
             return
         args = self._build_args()
+        est = transcribe.estimate_runtime(files, diarize=not args.no_diarize)
+        gpu = transcribe.gpu_status()
+        lines = [f"Tiempo estimado: ~{est:.0f} min"]
+        if transcribe.gpu_is_busy(gpu):
+            lines.append(
+                f"La GPU está ocupada: {gpu['util']:.0f}% de uso, "
+                f"{gpu['mem_used']:.0f}MB/{gpu['mem_total']:.0f}MB de VRAM "
+                f"({len(gpu['apps'])} proceso(s) de GPU)."
+            )
+            lines.append("Cierra navegadores, juegos u otras apps con aceleración gráfica "
+                         "para que vaya mucho más rápido.")
+        else:
+            lines.append("GPU libre, todo listo.")
+        lines.append("")
+        lines.append("¿Continuar?")
+        if not messagebox.askyesno("Transcripción", "\n".join(lines)):
+            return
         self.running = True
         self.stop_requested = False
         self.last_outputs = []

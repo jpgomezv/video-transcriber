@@ -29,6 +29,7 @@ import argparse
 import gc
 import json
 import os
+import subprocess
 import sys
 import time
 import datetime
@@ -541,6 +542,57 @@ def free_gpu() -> None:
     if torch is not None and torch.cuda.is_available():
         gc.collect()
         torch.cuda.empty_cache()
+
+
+# Measured on the GTX 1650 SUPER: minutes of wall-clock per minute of audio.
+RATE_ASR = 0.060
+RATE_ALIGN = 0.022
+RATE_DIARIZE = 0.065
+PER_FILE_OVERHEAD = 0.35  # model loads, VAD, I/O
+
+
+def estimate_runtime(files, diarize: bool = True) -> float:
+    """Rough total wall-clock estimate in minutes for the given files."""
+    total = 0.0
+    for f in files:
+        duration = media_duration(Path(f)) or 0.0
+        mins = duration / 60.0
+        total += mins * RATE_ASR + mins * RATE_ALIGN + PER_FILE_OVERHEAD
+        if diarize:
+            total += mins * RATE_DIARIZE
+    return total
+
+
+def gpu_status() -> dict | None:
+    """Quick snapshot of CUDA GPU load (util %, VRAM used, other GPU apps).
+
+    Returns None when nvidia-smi is unavailable (e.g. AMD/Intel hardware)."""
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=utilization.gpu,memory.used,memory.total",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=10,
+        ).stdout.strip().splitlines()
+        if not out:
+            return None
+        util, mem_used, mem_total = (float(x.strip()) for x in out[0].split(","))
+        apps = subprocess.run(
+            ["nvidia-smi", "--query-compute-apps=pid",
+             "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=10,
+        ).stdout.strip().splitlines()
+        return {"util": util, "mem_used": mem_used, "mem_total": mem_total,
+                "apps": list(apps)}
+    except Exception:
+        return None
+
+
+def gpu_is_busy(status: dict | None, util_threshold: float = 25.0,
+                mem_threshold: float = 1500.0) -> bool:
+    """True when other apps are likely contending for the GPU."""
+    if not status:
+        return False
+    return status["util"] >= util_threshold or status["mem_used"] >= mem_threshold
 
 
 def _is_cuda_oom(exc: Exception) -> bool:
@@ -1138,6 +1190,17 @@ def main(argv=None) -> int:
         sys.stderr = Tee(sys.stderr, log_file)
 
         ensure_punkt()
+
+        est = estimate_runtime(files, diarize=not args.no_diarize)
+        gpu = gpu_status()
+        print(f"[info] Estimated runtime: ~{est:.0f} min for {len(files)} file(s)"
+              f" (diarization {'on' if not args.no_diarize else 'off'})")
+        if gpu_is_busy(gpu):
+            seen = sorted({a.strip() for a in gpu["apps"]})
+            print(f"[warn] GPU is busy: {gpu['util']:.0f}% util, "
+                  f"{gpu['mem_used']:.0f}MB/{gpu['mem_total']:.0f}MB VRAM used "
+                  f"({len(seen)} GPU process(es): {', '.join(seen[:6])}). "
+                  "Close GPU-heavy apps (browsers, games) for much better speed.")
 
         t_run = time.monotonic()
         print(f"=== Run started: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===")
