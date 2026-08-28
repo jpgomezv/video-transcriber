@@ -110,6 +110,7 @@ class App(TkinterDnD.Tk):
         self.queue = queue.Queue()
         self.files: list[str] = []
         self.running = False
+        self.bench_running = False
         self.stop_requested = False
         self.out_folder: str | None = None
         self.last_outputs: list[Path] = []
@@ -199,29 +200,35 @@ class App(TkinterDnD.Tk):
             variable=self.var_auto_speaker,
         ).grid(row=4, column=0, columnspan=3, sticky="w", pady=3)
 
+        self.var_solo_profesor = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            grid, text="Generar extracto solo del profesor (*.solo-profesor.md)",
+            variable=self.var_solo_profesor,
+        ).grid(row=5, column=0, columnspan=3, sticky="w", pady=3)
+
         ttk.Label(grid, text="Nombre del hablante principal:").grid(
-            row=5, column=0, sticky="w", padx=(0, 10), pady=3
+            row=6, column=0, sticky="w", padx=(0, 10), pady=3
         )
         self.var_speaker_name = tk.StringVar(value="Profesor")
         ttk.Entry(grid, textvariable=self.var_speaker_name).grid(
-            row=5, column=1, columnspan=2, sticky="ew", pady=3
+            row=6, column=1, columnspan=2, sticky="ew", pady=3
         )
 
-        ttk.Label(grid, text="Guardar en:").grid(row=6, column=0, sticky="w", padx=(0, 10), pady=3)
+        ttk.Label(grid, text="Guardar en:").grid(row=7, column=0, sticky="w", padx=(0, 10), pady=3)
         self.var_out = tk.StringVar(value="video")
         ttk.Radiobutton(
             grid, text="Junto al video (carpeta por video)",
             variable=self.var_out, value="video",
-        ).grid(row=6, column=1, columnspan=2, sticky="w", pady=3)
-        row7 = ttk.Frame(grid)
-        row7.grid(row=7, column=1, columnspan=2, sticky="w", pady=3)
+        ).grid(row=7, column=1, columnspan=2, sticky="w", pady=3)
+        row8 = ttk.Frame(grid)
+        row8.grid(row=8, column=1, columnspan=2, sticky="w", pady=3)
         ttk.Radiobutton(
-            row7, text="Carpeta elegida:", variable=self.var_out, value="folder",
+            row8, text="Carpeta elegida:", variable=self.var_out, value="folder",
             command=self._on_out_mode,
         ).pack(side="left")
-        ttk.Button(row7, text="Elegir…", command=self.choose_folder,
+        ttk.Button(row8, text="Elegir…", command=self.choose_folder,
                    bootstyle="secondary-outline").pack(side="left", padx=6)
-        self.lbl_out_path = ttk.Label(row7, text="(ninguna)", foreground="gray")
+        self.lbl_out_path = ttk.Label(row8, text="(ninguna)", foreground="gray")
         self.lbl_out_path.pack(side="left")
 
         frm_run = ttk.LabelFrame(self, text=" 3. Transcribir ")
@@ -409,6 +416,9 @@ class App(TkinterDnD.Tk):
             auto_speaker=self.var_auto_speaker.get(),
             speaker_name=self.var_speaker_name.get().strip() or "Profesor",
             speaker_clips_dir=self.clip_dir,
+            no_vad_crop=False,
+            seg_stride=2.0,
+            solo_profesor=self.var_solo_profesor.get(),
             progress_callback=self._on_progress,
             phase_callback=self._on_phase,
             diarize_progress_callback=self._on_diarize_progress,
@@ -455,6 +465,8 @@ class App(TkinterDnD.Tk):
             "Mido tu velocidad real con la muestra incluida (~1 min, carga el modelo).\n"
             "Cierra apps con GPU para un resultado realista.")
         self.btn_bench.config(state="disabled")
+        self.bench_running = True
+        self.after(100, self._poll)
         threading.Thread(target=self._bench_worker, daemon=True).start()
 
     def _bench_worker(self):
@@ -462,17 +474,18 @@ class App(TkinterDnD.Tk):
         redirect = StreamRedirect(q)
         old_out, old_err = sys.stdout, sys.stderr
         sys.stdout = sys.stderr = redirect
+        result = None
         try:
             q.put(("status", "Midiendo velocidad..."))
             result = transcribe.run_benchmark(self._build_args())
-            q.put(("bench_result", result or {}))
         except Exception:
             q.put("\n" + traceback.format_exc() + "\n")
         finally:
             sys.stdout, sys.stderr = old_out, old_err
+            q.put(("bench_result", result or {}))
 
     def start(self):
-        if self.running:
+        if self.running or self.bench_running:
             return
         files = list(self.files)
         if not files:
@@ -619,18 +632,23 @@ class App(TkinterDnD.Tk):
                         self.progress.config(mode="determinate", value=rest[0])
                         self.status.config(text=f"Identificando hablantes… {rest[0]:.0f}%")
                     elif kind == "bench_result":
-                        r = rest[0]
+                        r = rest[0] or {}
+                        self.bench_running = False
                         self.btn_bench.config(state="normal")
                         self.status.config(text="Listo.")
-                        lines = ["Velocidades medidas (segundos por minuto de audio):"]
-                        lines.append(f"  ASR:        {r.get('asr_rate', 0) * 60:.1f} s/min")
-                        lines.append(f"  Alineación: {r.get('align_rate', 0) * 60:.1f} s/min")
-                        if r.get("diarize_rate"):
-                            lines.append(f"  Diarización:{r['diarize_rate'] * 60:.1f} s/min")
+                        if r.get("asr_rate") or r.get("align_rate") or r.get("diarize_rate"):
+                            lines = ["Velocidades medidas (segundos por minuto de audio):"]
+                            lines.append(f"  ASR:        {r.get('asr_rate', 0) * 60:.1f} s/min")
+                            lines.append(f"  Alineación: {r.get('align_rate', 0) * 60:.1f} s/min")
+                            if r.get("diarize_rate"):
+                                lines.append(f"  Diarización:{r['diarize_rate'] * 60:.1f} s/min")
+                            else:
+                                lines.append("  Diarización: (sin token o deshabilitada)")
+                            lines.append("")
+                            lines.append("Guardado. Las próximas estimaciones usarán estos valores.")
                         else:
-                            lines.append("  Diarización: (sin token o deshabilitada)")
-                        lines.append("")
-                        lines.append("Guardado. Las próximas estimaciones usarán estos valores.")
+                            lines = ["No se pudo medir la velocidad."]
+                            lines.append("Revisa el registro de arriba para ver el detalle.")
                         messagebox.showinfo("Prueba de velocidad", "\n".join(lines))
                     elif kind == "status":
                         self.status.config(text=rest[0])
@@ -656,7 +674,7 @@ class App(TkinterDnD.Tk):
                 self._log(line)
         except queue.Empty:
             pass
-        if self.running:
+        if self.running or self.bench_running:
             self.after(100, self._poll)
 
     def _finish(self):

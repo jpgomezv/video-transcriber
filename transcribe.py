@@ -500,6 +500,77 @@ def extract_speaker_clips(audio, segments: list, out_dir, clip_seconds: float = 
     return clips
 
 
+def speech_chunks(segments: list, pad: float = 1.0, merge_gap: float = 3.0) -> list[tuple[float, float]]:
+    """Speech regions = union of aligned segment spans (the transcript itself),
+    with a small padding and nearby gaps merged. Returns (start, end) pairs in
+    original audio seconds. Diarizing only these regions skips the silence in
+    lecture recordings; the transcript timestamps are never touched. The
+    padding/merge keep segment seams away from speech so the diarizer sees
+    clean windows (small values make seams land inside turns and flip labels)."""
+    spans = sorted(
+        (seg["start"], seg["end"])
+        for seg in segments
+        if seg.get("start") is not None and seg.get("end") is not None
+        and seg["end"] > seg["start"]
+    )
+    if not spans:
+        return []
+    chunks: list[tuple[float, float]] = []
+    s0, e0 = spans[0]
+    for s, e in spans[1:]:
+        if s - e0 <= merge_gap:
+            e0 = max(e0, e)
+        else:
+            chunks.append((max(0.0, s0 - pad), e0 + pad))
+            s0, e0 = s, e
+    chunks.append((max(0.0, s0 - pad), e0 + pad))
+    return chunks
+
+
+def apply_seg_stride(dia, stride: float | None) -> None:
+    """Speed knob for pyannote 4.x pipelines: the segmentation sliding-window
+    step. The default 1s stride recomputes every 10s window with heavy overlap;
+    doubling it (2s) skips redundant inference (~4x faster segmentation, per
+    SDBench 2025 the DER penalty is only ~+0.02 for up to 5 speakers and ~+0.05
+    for more). Falls back silently when the attribute is missing."""
+    if not stride or stride <= 0:
+        return
+    try:
+        seg = getattr(dia.model, "_segmentation", None)
+        if seg is not None and hasattr(seg, "step") and float(seg.step) != float(stride):
+            seg.step = float(stride)
+            print(f"[info] Segmentation step: {seg.step} s")
+    except Exception:
+        pass
+
+
+def crop_audio(audio, chunks: list[tuple[float, float]]):
+    """Concatenate the speech chunks into one stream so diarization still sees
+    every speaker consistently across the whole file.
+
+    Returns (cropped_audio, map_fn) where map_fn(crop_time) -> original time."""
+    if not chunks:
+        return audio, lambda t: t
+    import numpy as np
+
+    pieces: list[np.ndarray] = []
+    offsets: list[tuple[float, float]] = []
+    cur = 0.0
+    for s, e in chunks:
+        pieces.append(audio[int(s * 16000): int(e * 16000)])
+        offsets.append((cur, s))
+        cur += e - s
+    cropped = np.concatenate(pieces) if len(pieces) > 1 else pieces[0]
+
+    def map_fn(t: float) -> float:
+        for (c0, o0), (c1, _o1) in zip(offsets, offsets[1:] + [(float("inf"), 0.0)]):
+            if t < c1:
+                return o0 + (t - c0)
+        return offsets[-1][1] + (t - offsets[-1][0])
+
+    return cropped, map_fn
+
+
 # --------------------------------------------------------------------------- #
 # NLTK punkt (needed by WhisperX sentence segmentation)
 # --------------------------------------------------------------------------- #
@@ -1045,8 +1116,31 @@ def _diarize_write(prep: dict, args, cache: ModelCache) -> dict | None:
                         dia = DiarizationPipeline(
                             model_name=str(diarize_model_path), token=token, device=device
                         )
+                        apply_seg_stride(dia, getattr(args, "seg_stride", 2.0))
                         cache.put("diarize", dia)
-                    diarize_segments = dia(audio, progress_callback=diar_progress)
+                    # B: diarize only the speech regions (the aligned transcript
+                    # marks them) and remap segment times back afterwards — the
+                    # transcript/subtitle timestamps are never touched.
+                    use_crop = (not getattr(args, "no_vad_crop", False)
+                                and device == "cuda")
+                    diar_input = audio
+                    remap = None
+                    if use_crop:
+                        chunks = speech_chunks(segments)
+                        if chunks:
+                            cropped, map_fn = crop_audio(audio, chunks)
+                            if len(cropped) < len(audio) * 0.85:
+                                diar_input = cropped
+                                remap = map_fn
+                                print(f"[info] Diarizando solo las regiones de voz"
+                                      f" ({len(audio) / 16000 / 60:.0f} →"
+                                      f" {len(cropped) / 16000 / 60:.0f} min,"
+                                      f" {len(chunks)} bloque(s))")
+                    diarize_segments = dia(diar_input, progress_callback=diar_progress)
+                    if remap is not None:
+                        diarize_segments = diarize_segments.copy()
+                        diarize_segments["start"] = diarize_segments["start"].map(remap)
+                        diarize_segments["end"] = diarize_segments["end"].map(remap)
                     result = whisperx.assign_word_speakers(diarize_segments, result)
                     segments = result["segments"]
                     diarized = True
@@ -1065,7 +1159,8 @@ def _diarize_write(prep: dict, args, cache: ModelCache) -> dict | None:
                               " freed the ASR model and retrying...")
                     else:
                         print(f"[warn] Diarization failed ({exc});"
-                              " transcript is without speaker labels.")
+                              " transcript is without speaker labels.", file=sys.stderr)
+                        traceback.print_exc()
                         break
         else:
             print(
@@ -1076,20 +1171,30 @@ def _diarize_write(prep: dict, args, cache: ModelCache) -> dict | None:
                 "  Then run with:  set HF_TOKEN=hf_xxxx  (or pass --hf-token)"
             )
 
-    # 3.5 Speaker naming: auto main speaker + voice clips
+    # 3.5 Speaker naming: auto main speaker + grouped classmates + voice clips
     names: dict = {}
     payload = None
+    teacher_key: str | None = None
+    teacher_label: str | None = None
     if diarized:
         totals = speaker_totals(segments)
+        dom, dom_secs = dominant_speaker(segments)
         if getattr(args, "auto_speaker", False):
-            dom, dom_secs = dominant_speaker(segments)
             label = getattr(args, "speaker_name", None) or "Profesor"
             if dom:
                 names[dom] = label
+                teacher_key, teacher_label = dom, label
                 print(f"[info] Main speaker: {dom} ({dom_secs / 60:.1f} min spoken) -> '{label}'")
-        clip_dir = getattr(args, "speaker_clips_dir", None)
+            others = sorted((sp for sp in totals if sp != dom), key=lambda s: -totals[s])
+            for i, sp in enumerate(others, start=1):
+                names[sp] = f"Estudiante {i}"
+        clip_dir = (getattr(args, "speaker_clips_dir", None)
+                    or getattr(args, "speaker_clips", None))
         clips = {}
         if clip_dir:
+            # Per-file subfolder: speaker labels repeat in every video of a
+            # batch and would otherwise overwrite each other's samples.
+            clip_dir = Path(clip_dir) / path.stem
             clips = extract_speaker_clips(audio, segments, clip_dir)
         payload = {"clips": clips, "totals": totals, "names": dict(names), "outputs": []}
 
@@ -1115,6 +1220,13 @@ def _diarize_write(prep: dict, args, cache: ModelCache) -> dict | None:
         write_markdown(md_path, title, str(path), meta, segments, names)
         written.append(str(md_path))
         print(f"[ok] {md_path}")
+        if teacher_key and getattr(args, "solo_profesor", True):
+            solo = [s for s in segments if speaker_of(s) == teacher_key]
+            solo_path = out_dir / f"{stem}.solo-profesor.md"
+            write_markdown(solo_path, f"{title} — {teacher_label} (extracto)",
+                           str(path), meta, solo, names)
+            written.append(str(solo_path))
+            print(f"[ok] {solo_path}")
     if "srt" in wanted:
         srt_path = out_dir / f"{stem}.srt"
         write_srt(srt_path, segments, names)
@@ -1212,6 +1324,7 @@ def run_benchmark(args) -> dict | None:
                     marker="config.yaml")),
                 token=token, device=device,
             )
+            apply_seg_stride(dia, getattr(args, "seg_stride", 2.0))
             t0 = time.monotonic()
             dia(audio)
             diar_rate = (time.monotonic() - t0) / 60 / audio_minutes
@@ -1379,6 +1492,19 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="Label for the main speaker (default: Profesor)")
     p.add_argument("--speaker-clips", default=None, metavar="DIR",
                    help="Save one short WAV per speaker (their longest turn) into DIR")
+    p.add_argument("--no-vad-crop", action="store_true",
+                   help="Diarize the full audio instead of only the speech "
+                        "regions (default: speech-only diarization with "
+                        "timestamps remapped — subtitles are unaffected)")
+    p.add_argument("--seg-stride", type=float, default=2.0, metavar="SECONDS",
+                   help="Sliding-window step for the diarizer segmentation "
+                        "(default: 2.0 = ~4x faster than the 1s pyannote "
+                        "default with a negligible accuracy hit; 1.0 = "
+                        "matched to upstream, keep for reference outputs)")
+    p.add_argument("--no-solo-profesor", dest="solo_profesor", action="store_false",
+                   default=True,
+                   help="Skip the teacher-only markdown extract (default: "
+                        "written when --auto-speaker identifies the main speaker)")
     p.add_argument("--hf-token", default=None,
                    help="Hugging Face token for diarization (or set HF_TOKEN)")
     p.add_argument("--device", choices=["cuda", "cpu"], default=None,
