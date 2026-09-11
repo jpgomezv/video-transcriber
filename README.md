@@ -25,12 +25,12 @@ Built on [WhisperX](https://github.com/m-bain/whisperX) — faster-whisper for s
 - Local and offline after one-time model download (models cached in `models/`)
 - GPU-accelerated with CUDA (falls back to CPU), quantized int8 to fit low-VRAM cards
 - Speaker diarization: each voice becomes `SPEAKER_00`, `SPEAKER_01`, ...
-- Configurable main speaker: assign a label to the most-spoken speaker automatically (classmates get grouped as `Estudiante 1..N`), or mark it manually by listening to a short audio sample of each voice
-- Teacher extract: `*.solo-profesor.md` with only the main speaker's lines, written alongside the full transcript
+- Configurable main speaker: assign a label to the most-spoken speaker automatically (the other voices get grouped as `Hablante 1..N`), or mark it manually by listening to a short audio sample of each voice
+- Main-speaker extract: `*.solo-principal.md` with only the main speaker's lines, written alongside the full transcript
 - Name every voice and merge duplicated ones: two speakers given the same label become one person
 - Hallucination guard: collapses repeated-word loops and drops repeated segments
 - Speech-only diarization: only the regions the transcript marks as speech are diarized (silence skipped, timestamps remapped — subtitles unaffected)
-- Fast diarization: the segmentation sliding-window step runs at 2s (~2-4x faster than pyannote's 1s default; teacher labels hold, classmates just get coarser grouping — `--seg-stride` to tune)
+- Fast diarization: the segmentation sliding-window step runs at 2s (~2-4x faster than pyannote's 1s default; main-speaker labels hold, the rest just get coarser grouping — `--seg-stride` to tune)
 - Alignment and diarization models are reused across files; the ASR model is unloaded before diarization so it stays fast on low-VRAM cards
 - Graceful GPU-out-of-memory recovery (halves the batch size and retries)
 - Bilingual-friendly: Spanish by default, with a prompt that keeps English technical terms intact
@@ -104,8 +104,8 @@ uv run transcribe.py video.mp4 --lang es --auto-speaker --speaker-name Profesor
 | `--speaker-name` | `Profesor` | Label for the main speaker |
 | `--speaker-clips DIR` | — | Save a short WAV per speaker to listen to the voices (one subfolder per file) |
 | `--no-vad-crop` | off | Diarize the full audio instead of only the speech regions |
-| `--seg-stride` | `2.0` | Segmentation window step (2.0 = ~2-4x faster diarization with negligible teacher-label impact; 1.0 = upstream default) |
-| `--no-solo-profesor` | on | Skip the teacher-only `*.solo-profesor.md` extract |
+| `--seg-stride` | `2.0` | Segmentation window step (2.0 = ~2-4x faster diarization with negligible main-speaker-label impact; 1.0 = upstream default) |
+| `--no-solo-principal` | on | Skip the main-speaker-only `*.solo-principal.md` extract |
 
 ## Output layout
 

@@ -1171,11 +1171,11 @@ def _diarize_write(prep: dict, args, cache: ModelCache) -> dict | None:
                 "  Then run with:  set HF_TOKEN=hf_xxxx  (or pass --hf-token)"
             )
 
-    # 3.5 Speaker naming: auto main speaker + grouped classmates + voice clips
+    # 3.5 Speaker naming: auto main speaker + grouped rest + voice clips
     names: dict = {}
     payload = None
-    teacher_key: str | None = None
-    teacher_label: str | None = None
+    main_key: str | None = None
+    main_label: str | None = None
     if diarized:
         totals = speaker_totals(segments)
         dom, dom_secs = dominant_speaker(segments)
@@ -1183,11 +1183,11 @@ def _diarize_write(prep: dict, args, cache: ModelCache) -> dict | None:
             label = getattr(args, "speaker_name", None) or "Profesor"
             if dom:
                 names[dom] = label
-                teacher_key, teacher_label = dom, label
+                main_key, main_label = dom, label
                 print(f"[info] Main speaker: {dom} ({dom_secs / 60:.1f} min spoken) -> '{label}'")
             others = sorted((sp for sp in totals if sp != dom), key=lambda s: -totals[s])
             for i, sp in enumerate(others, start=1):
-                names[sp] = f"Estudiante {i}"
+                names[sp] = f"Hablante {i}"
         clip_dir = (getattr(args, "speaker_clips_dir", None)
                     or getattr(args, "speaker_clips", None))
         clips = {}
@@ -1220,10 +1220,10 @@ def _diarize_write(prep: dict, args, cache: ModelCache) -> dict | None:
         write_markdown(md_path, title, str(path), meta, segments, names)
         written.append(str(md_path))
         print(f"[ok] {md_path}")
-        if teacher_key and getattr(args, "solo_profesor", True):
-            solo = [s for s in segments if speaker_of(s) == teacher_key]
-            solo_path = out_dir / f"{stem}.solo-profesor.md"
-            write_markdown(solo_path, f"{title} — {teacher_label} (extracto)",
+        if main_key and getattr(args, "solo_principal", True):
+            solo = [s for s in segments if speaker_of(s) == main_key]
+            solo_path = out_dir / f"{stem}.solo-principal.md"
+            write_markdown(solo_path, f"{title} — {main_label} (extracto)",
                            str(path), meta, solo, names)
             written.append(str(solo_path))
             print(f"[ok] {solo_path}")
@@ -1501,10 +1501,12 @@ def parse_args(argv=None) -> argparse.Namespace:
                         "(default: 2.0 = ~4x faster than the 1s pyannote "
                         "default with a negligible accuracy hit; 1.0 = "
                         "matched to upstream, keep for reference outputs)")
-    p.add_argument("--no-solo-profesor", dest="solo_profesor", action="store_false",
+    p.add_argument("--no-solo-principal", dest="solo_principal", action="store_false",
                    default=True,
-                   help="Skip the teacher-only markdown extract (default: "
+                   help="Skip the main-speaker-only markdown extract (default: "
                         "written when --auto-speaker identifies the main speaker)")
+    p.add_argument("--no-solo-profesor", dest="solo_principal", action="store_false",
+                   help=argparse.SUPPRESS)  # legacy alias, same as --no-solo-principal
     p.add_argument("--hf-token", default=None,
                    help="Hugging Face token for diarization (or set HF_TOKEN)")
     p.add_argument("--device", choices=["cuda", "cpu"], default=None,

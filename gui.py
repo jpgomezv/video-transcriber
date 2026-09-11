@@ -200,10 +200,10 @@ class App(TkinterDnD.Tk):
             variable=self.var_auto_speaker,
         ).grid(row=4, column=0, columnspan=3, sticky="w", pady=3)
 
-        self.var_solo_profesor = tk.BooleanVar(value=True)
+        self.var_solo_principal = tk.BooleanVar(value=True)
         ttk.Checkbutton(
-            grid, text="Generar extracto solo del profesor (*.solo-profesor.md)",
-            variable=self.var_solo_profesor,
+            grid, text="Generar extracto solo del hablante principal (*.solo-principal.md)",
+            variable=self.var_solo_principal,
         ).grid(row=5, column=0, columnspan=3, sticky="w", pady=3)
 
         ttk.Label(grid, text="Nombre del hablante principal:").grid(
@@ -363,6 +363,7 @@ class App(TkinterDnD.Tk):
                 "model": self.var_model.get(),
                 "diarize": self.var_diar.get(),
                 "auto_speaker": self.var_auto_speaker.get(),
+                "solo_principal": self.var_solo_principal.get(),
                 "speaker_name": self.var_speaker_name.get(),
                 "out_mode": self.var_out.get(),
                 "out_folder": self.out_folder or "",
@@ -388,6 +389,7 @@ class App(TkinterDnD.Tk):
             self.var_model.set(s["model"])
         self.var_diar.set(bool(s.get("diarize", True)))
         self.var_auto_speaker.set(bool(s.get("auto_speaker", True)))
+        self.var_solo_principal.set(bool(s.get("solo_principal", True)))
         if s.get("speaker_name"):
             self.var_speaker_name.set(s["speaker_name"])
         if s.get("out_mode") == "folder":
@@ -418,7 +420,7 @@ class App(TkinterDnD.Tk):
             speaker_clips_dir=self.clip_dir,
             no_vad_crop=False,
             seg_stride=2.0,
-            solo_profesor=self.var_solo_profesor.get(),
+            solo_principal=self.var_solo_principal.get(),
             progress_callback=self._on_progress,
             phase_callback=self._on_phase,
             diarize_progress_callback=self._on_diarize_progress,
