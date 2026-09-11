@@ -59,15 +59,15 @@ def build_theme():
     return ThemeDefinition(name="darkpurple", colors=colors, mode=DARK)
 
 
-def enable_dark_titlebar(widget):
+def enable_dark_titlebar(widget, dark: bool = True):
     """Paint the OS title bar (minimize/maximize/close area) dark instead of
-    white, using Windows' DWM immersive dark mode."""
+    white, using Windows' DWM immersive dark mode (or back to light)."""
     try:
         import ctypes
 
         hwnd = widget.winfo_id()
         for attr in (20, 19):  # DWMWA_USE_IMMERSIVE_DARK_MODE (Win11 / Win10)
-            value = ctypes.c_int(1)
+            value = ctypes.c_int(1 if dark else 0)
             ok = ctypes.windll.dwmapi.DwmSetWindowAttribute(
                 hwnd, attr, ctypes.byref(value), ctypes.sizeof(value)
             )
@@ -100,15 +100,23 @@ class App(TkinterDnD.Tk):
     def __init__(self):
         super().__init__()
         self.title("Transcripción de videos")
-        self.geometry("820x700")
-        self.minsize(720, 600)
+        self.geometry("940x860")
+        self.minsize(860, 700)
         self.style = ttk.Style()
         self.style.register_theme(build_theme())
         self.style.theme_use("darkpurple")
         self.colors = self.style.colors
+        try:
+            import tkinter.font as tkfont
+            tkfont.nametofont("TkDefaultFont").configure(family="Segoe UI", size=10)
+            self.style.configure("TLabelframe.Label", font=("Segoe UI", 10, "bold"))
+        except Exception:
+            pass
         enable_dark_titlebar(self)
         self.queue = queue.Queue()
         self.files: list[str] = []
+        self.file_state: dict[str, str] = {}
+        self.file_dur: dict[str, str] = {}
         self.running = False
         self.bench_running = False
         self.stop_requested = False
@@ -123,6 +131,7 @@ class App(TkinterDnD.Tk):
 
         self._build()
         self._apply_saved_settings()
+        self._apply_theme(save=False)
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self.drop_target_register(DND_FILES)
         self.dnd_bind("<<Drop>>", self.on_drop)
@@ -134,19 +143,23 @@ class App(TkinterDnD.Tk):
         frm_files = ttk.LabelFrame(self, text=" 1. Archivos — arrastra y suelta aquí ")
         frm_files.pack(fill="x", **pad)
         row = ttk.Frame(frm_files)
-        row.pack(fill="x", padx=6, pady=6)
-        self.listbox = tk.Listbox(row, height=6, selectmode="extended",
-                                  background=self.colors.bg, foreground=self.colors.fg,
-                                  selectbackground=self.colors.primary,
-                                  selectforeground=self.colors.fg,
-                                  relief="flat", highlightthickness=0)
-        self.listbox.pack(side="left", fill="both", expand=True)
-        self.listbox.drop_target_register(DND_FILES)
-        self.listbox.dnd_bind("<<Drop>>", self.on_drop)
-        sb = ttk.Scrollbar(row, orient="vertical", command=self.listbox.yview,
+        row.pack(fill="x", padx=8, pady=8)
+        self.tree = ttk.Treeview(row, columns=("file", "dur", "status"),
+                                 show="headings", height=6, selectmode="extended",
+                                 bootstyle="primary")
+        self.tree.heading("file", text="Archivo")
+        self.tree.heading("dur", text="Duración")
+        self.tree.heading("status", text="Estado")
+        self.tree.column("file", stretch=True)
+        self.tree.column("dur", width=90, anchor="center", stretch=False)
+        self.tree.column("status", width=170, anchor="w", stretch=False)
+        self.tree.pack(side="left", fill="both", expand=True)
+        self.tree.drop_target_register(DND_FILES)
+        self.tree.dnd_bind("<<Drop>>", self.on_drop)
+        sb = ttk.Scrollbar(row, orient="vertical", command=self.tree.yview,
                            bootstyle="round")
         sb.pack(side="right", fill="y")
-        self.listbox.config(yscrollcommand=sb.set)
+        self.tree.config(yscrollcommand=sb.set)
         btns = ttk.Frame(frm_files)
         btns.pack(fill="x", padx=6, pady=(0, 6))
         ttk.Button(btns, text="Añadir archivos…", command=self.add_files,
@@ -231,14 +244,31 @@ class App(TkinterDnD.Tk):
         self.lbl_out_path = ttk.Label(row8, text="(ninguna)", foreground="gray")
         self.lbl_out_path.pack(side="left")
 
+        ttk.Label(grid, text="Tema:").grid(
+            row=9, column=0, sticky="w", padx=(0, 10), pady=3
+        )
+        self.var_theme = tk.StringVar(value="Oscuro")
+        self.cmb_theme = ttk.Combobox(grid, textvariable=self.var_theme,
+                                      values=["Oscuro", "Claro"],
+                                      state="readonly", width=12)
+        self.cmb_theme.grid(row=9, column=1, sticky="w", pady=3)
+        self.cmb_theme.bind("<<ComboboxSelected>>", lambda _e: self._apply_theme())
+        grid.columnconfigure(1, weight=1)
+
         frm_run = ttk.LabelFrame(self, text=" 3. Transcribir ")
         frm_run.pack(fill="both", expand=True, **pad)
         self.btn_start = ttk.Button(frm_run, text="▶  Transcribir", command=self.start,
                                     bootstyle="success")
-        self.btn_start.pack(pady=8)
+        self.btn_start.pack(fill="x", padx=6, pady=10)
+        try:
+            self.style.configure("success.TButton", font=("Segoe UI", 11, "bold"))
+        except Exception:
+            pass
         self.progress = ttk.Progressbar(frm_run, maximum=100, value=0,
                                         bootstyle="primary-striped")
-        self.progress.pack(fill="x", padx=6, pady=(0, 4))
+        self.progress.pack(fill="x", padx=6, pady=(0, 2))
+        self.file_status = ttk.Label(frm_run, text="", foreground="gray")
+        self.file_status.pack(fill="x", padx=6)
         btn_row = ttk.Frame(frm_run)
         btn_row.pack(fill="x", padx=6, pady=(0, 4))
         self.btn_stop = ttk.Button(btn_row, text="Detener", command=self.request_stop,
@@ -267,7 +297,8 @@ class App(TkinterDnD.Tk):
         )
         self.status.pack(fill="x", padx=6)
         c = self.colors
-        self.log = tk.Text(frm_run, height=12, state="disabled", wrap="word",
+        self.log = tk.Text(frm_run, height=14, state="disabled", wrap="word",
+                           font=("Consolas", 9),
                            background=c.dark, foreground=c.fg,
                            insertbackground=c.fg, relief="flat",
                            borderwidth=0, highlightthickness=0,
@@ -285,10 +316,22 @@ class App(TkinterDnD.Tk):
         self.log.see("end")
         self.log.config(state="disabled")
 
+    def _file_dur(self, f: str) -> str:
+        if f not in self.file_dur:
+            try:
+                secs = transcribe.media_duration(Path(f))
+                self.file_dur[f] = transcribe.hms(secs) if secs else "?"
+            except Exception:
+                self.file_dur[f] = "?"
+        return self.file_dur[f]
+
     def _refresh(self):
-        self.listbox.delete(0, "end")
+        for iid in self.tree.get_children():
+            self.tree.delete(iid)
         for f in self.files:
-            self.listbox.insert("end", f)
+            self.tree.insert("", "end", iid=f,
+                             values=(Path(f).name, self._file_dur(f),
+                                     self.file_state.get(f, "En cola")))
         self.file_count.config(text=f"{len(self.files)} archivos")
 
     def _add_paths(self, paths: list[str]):
@@ -323,13 +366,19 @@ class App(TkinterDnD.Tk):
             self._add_paths(list(paths))
 
     def remove_selected(self):
-        sel = list(self.listbox.curselection())
-        for idx in reversed(sel):
-            del self.files[idx]
+        sel = set(self.tree.selection())
+        if not sel:
+            return
+        self.files = [f for f in self.files if f not in sel]
+        for f in sel:
+            self.file_state.pop(f, None)
+            self.file_dur.pop(f, None)
         self._refresh()
 
     def clear_files(self):
         self.files = []
+        self.file_state = {}
+        self.file_dur = {}
         self._refresh()
 
     def choose_folder(self):
@@ -364,6 +413,7 @@ class App(TkinterDnD.Tk):
                 "diarize": self.var_diar.get(),
                 "auto_speaker": self.var_auto_speaker.get(),
                 "solo_principal": self.var_solo_principal.get(),
+                "theme": self.var_theme.get(),
                 "speaker_name": self.var_speaker_name.get(),
                 "out_mode": self.var_out.get(),
                 "out_folder": self.out_folder or "",
@@ -390,6 +440,8 @@ class App(TkinterDnD.Tk):
         self.var_diar.set(bool(s.get("diarize", True)))
         self.var_auto_speaker.set(bool(s.get("auto_speaker", True)))
         self.var_solo_principal.set(bool(s.get("solo_principal", True)))
+        if s.get("theme") in ("Oscuro", "Claro"):
+            self.var_theme.set(s["theme"])
         if s.get("speaker_name"):
             self.var_speaker_name.set(s["speaker_name"])
         if s.get("out_mode") == "folder":
@@ -397,6 +449,26 @@ class App(TkinterDnD.Tk):
         if s.get("out_folder"):
             self.out_folder = s["out_folder"]
             self.lbl_out_path.config(text=self.out_folder)
+
+    _THEMES = {"Oscuro": "darkpurple", "Claro": "flatly"}
+
+    def _apply_theme(self, save: bool = True) -> None:
+        """Switch ttk theme at runtime and refresh the manually-colored
+        widgets (log box); ttk widgets restyle themselves."""
+        name = self._THEMES.get(self.var_theme.get(), "darkpurple")
+        try:
+            self.style.theme_use(name)
+        except Exception:
+            return
+        self.colors = self.style.colors
+        enable_dark_titlebar(self, dark=(name == "darkpurple"))
+        try:
+            self.log.config(background=self.colors.bg, foreground=self.colors.fg,
+                            insertbackground=self.colors.fg)
+        except Exception:
+            pass
+        if save:
+            self._save_settings()
 
     # ------------------------------------------------------------ pipeline
     def _build_args(self) -> argparse.Namespace:
@@ -527,6 +599,10 @@ class App(TkinterDnD.Tk):
         self.reviews = []
         self.last_log_path = None
         self.run_start = time.monotonic()
+        self.file_state = {f: "En cola" for f in files}
+        self._refresh()
+        self.file_status.config(text="")
+        self.title(f"Transcribiendo {len(files)} archivo(s) — Transcripción de videos")
         self.progress.config(mode="determinate", value=0)
         self.btn_start.config(state="disabled")
         self.btn_stop.config(state="normal")
@@ -558,10 +634,12 @@ class App(TkinterDnD.Tk):
                     q.put("[warn] Detenido por el usuario; archivos restantes omitidos.\n")
                     break
                 q.put(("status", f"Transcribiendo {i}/{len(files)}: {Path(f).name}..."))
+                q.put(("file_status", f, "Transcribiendo…", i, len(files)))
                 q.put(f"\n>>> {Path(f).name}\n")
                 try:
                     prepared.append(transcribe.get_prep(Path(f), args, cache))
                 except Exception as exc:
+                    q.put(("file_status", f, "Error", i, len(files)))
                     q.put("\n" + traceback.format_exc() + "\n")
                     if transcribe._is_cuda_fatal(exc):
                         fatal = True
@@ -580,6 +658,8 @@ class App(TkinterDnD.Tk):
                     break
                 q.put(("status", f"Identificando hablantes {i}/{len(prepared)}: "
                                  f"{Path(prep['path']).name}..."))
+                q.put(("file_status", str(prep["path"]), "Identificando hablantes…",
+                       i, len(prepared)))
                 try:
                     payload = transcribe._diarize_write(prep, args, cache)
                     if payload:
@@ -591,8 +671,12 @@ class App(TkinterDnD.Tk):
                             "totals": payload["totals"],
                             "names": payload["names"],
                         }))
+                    q.put(("file_status", str(prep["path"]), "Completado ✓",
+                           i, len(prepared)))
                     q.put(f"\n>>> Completado: {Path(prep['path']).name}\n")
                 except Exception:
+                    q.put(("file_status", str(prep["path"]), "Error",
+                           i, len(prepared)))
                     q.put("\n" + traceback.format_exc() + "\n")
             # Record measured rates for better estimates on this machine.
             try:
@@ -633,6 +717,19 @@ class App(TkinterDnD.Tk):
                     elif kind == "diar_progress":
                         self.progress.config(mode="determinate", value=rest[0])
                         self.status.config(text=f"Identificando hablantes… {rest[0]:.0f}%")
+                    elif kind == "file_status":
+                        fpath, text, i, n = rest[0], rest[1], rest[2], rest[3]
+                        self.file_state[fpath] = text
+                        try:
+                            if self.tree.exists(fpath):
+                                vals = list(self.tree.item(fpath, "values"))
+                                vals[2] = text
+                                self.tree.item(fpath, values=vals)
+                        except Exception:
+                            pass
+                        base = Path(fpath).name
+                        self.file_status.config(text=f"Actual: {base} — {text}")
+                        self.title(f"[{i}/{n}] {base} — Transcripción de videos")
                     elif kind == "bench_result":
                         r = rest[0] or {}
                         self.bench_running = False
@@ -681,6 +778,7 @@ class App(TkinterDnD.Tk):
 
     def _finish(self):
         self.running = False
+        self.title("Transcripción de videos")
         self.progress.stop()
         self.progress.config(mode="determinate", value=100)
         self.btn_start.config(state="normal")
@@ -745,23 +843,34 @@ class App(TkinterDnD.Tk):
         dlg.title(f"Revisar hablantes — {entry['key']}")
         dlg.resizable(False, False)
         dlg.configure(background=self.colors.bg)
-        enable_dark_titlebar(dlg)
+        enable_dark_titlebar(dlg, dark=(self.var_theme.get() != "Claro"))
+        ttk.Label(
+            dlg,
+            text=f"{entry['key']} · {len(speakers)} voces",
+            font=("Segoe UI", 10, "bold"),
+            justify="center",
+        ).pack(padx=20, pady=(14, 2))
         ttk.Label(
             dlg,
             text="Escucha cada voz y ponle nombre. Deja un nombre para mantenerlo;\n"
                  "dos voces con el mismo nombre se fusionan en una sola persona.",
             justify="center",
-        ).pack(padx=20, pady=(16, 8))
+        ).pack(padx=20, pady=(0, 8))
+        try:
+            self.style.configure("RowA.TFrame", background=self.colors.bg)
+            self.style.configure("RowB.TFrame", background=self.colors.inputbg)
+        except Exception:
+            pass
         entries: dict[str, ttk.Entry] = {}
-        for sp, secs in speakers:
-            row = ttk.Frame(dlg)
-            row.pack(fill="x", padx=20, pady=2)
+        for idx, (sp, secs) in enumerate(speakers):
+            row = ttk.Frame(dlg, style="RowB.TFrame" if idx % 2 else "RowA.TFrame")
+            row.pack(fill="x", padx=12, pady=1)
             current = entry["names"].get(sp, sp)
             mins = secs / 60
             ttk.Label(row, text=f"{mins:.1f} min").pack(side="left")
             for clip in entry["clips"].get(sp, []):
                 ttk.Button(
-                    row, text="▶", width=3,
+                    row, text="▶", width=4,
                     command=lambda p=clip: self._play_clip(p),
                 ).pack(side="left", padx=(4, 0))
             ttk.Label(row, text="·").pack(side="left", padx=4)
@@ -782,6 +891,8 @@ class App(TkinterDnD.Tk):
             dlg.destroy()
 
         ttk.Button(dlg, text="Guardar", command=ok).pack(pady=(12, 16))
+        dlg.bind("<Return>", lambda _e: ok())
+        dlg.bind("<Escape>", lambda _e: dlg.destroy())
         dlg.update_idletasks()
         dlg.geometry(f"+{self.winfo_rootx() + 120}+{self.winfo_rooty() + 120}")
         dlg.grab_set()
