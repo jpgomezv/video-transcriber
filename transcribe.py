@@ -1078,14 +1078,6 @@ def _diarize_write(prep: dict, args, cache: ModelCache) -> dict | None:
 
     audio = whisperx.load_audio(str(path))
 
-    def phase(name: str) -> None:
-        cb = getattr(args, "phase_callback", None)
-        if cb is not None:
-            try:
-                cb(name)
-            except Exception:
-                pass
-
     diar_progress = getattr(args, "diarize_progress_callback", None)
 
     # 3. Speaker diarization (optional)
