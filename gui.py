@@ -358,8 +358,8 @@ class App(TkinterDnD.Tk):
     def add_files(self):
         paths = filedialog.askopenfilenames(
             title="Elige videos o audios",
-            filetypes=[("Video/Audio", "*.mp4 *.mov *.mkv *.webm *.m4v *.avi *.wmv "
-                                     "*.m4a *.mp3 *.wav *.flac *.ogg *.aac *.opus"),
+            filetypes=[("Video/Audio", "*.mp4 *.mov *.mkv *.webm *.m4v *.avi *.wmv *.mpg *.mpeg "
+                                     "*.m4a *.mp3 *.wav *.wma *.flac *.ogg *.aac *.opus"),
                        ("Todos los archivos", "*.*")],
         )
         if paths:
@@ -430,11 +430,17 @@ class App(TkinterDnD.Tk):
             return
         for key in FORMATS:
             label_key = key[1]
-            if label_key in s.get("formats", []):
-                self.var_fmts[label_key].set(True)
+            if "formats" in s:
+                self.var_fmts[label_key].set(label_key in s.get("formats", []))
+            else:
+                self.var_fmts[label_key].set(bool(key[2]))
         lang_labels = {code: label for label, code in LANGUAGES}
-        if s.get("lang") in lang_labels:
-            self.var_lang.set(lang_labels[s["lang"]])
+        lang_codes = {label: code for label, code in LANGUAGES}
+        lang_val = s.get("lang")
+        if lang_val in lang_labels:
+            self.var_lang.set(lang_labels[lang_val])
+        elif lang_val in lang_codes:
+            self.var_lang.set(lang_val)
         if s.get("model") in MODELS:
             self.var_model.set(s["model"])
         self.var_diar.set(bool(s.get("diarize", True)))
@@ -773,8 +779,11 @@ class App(TkinterDnD.Tk):
                 self._log(line)
         except queue.Empty:
             pass
-        if self.running or self.bench_running:
-            self.after(100, self._poll)
+        except Exception:
+            self._log("\n" + traceback.format_exc() + "\n")
+        finally:
+            if self.running or self.bench_running:
+                self.after(100, self._poll)
 
     def _finish(self):
         self.running = False
@@ -816,12 +825,22 @@ class App(TkinterDnD.Tk):
         ttk.Label(dlg, text="¿Qué archivo quieres revisar?", justify="center"
                   ).pack(padx=24, pady=(16, 8))
         keys = [r["key"] for r in self.reviews]
-        var = tk.StringVar(value=keys[0])
-        ttk.Combobox(dlg, textvariable=var, values=keys, state="readonly",
+        labels = []
+        for r in self.reviews:
+            label = r["key"]
+            if keys.count(r["key"]) > 1:
+                label = f"{r['key']} — {Path(r['path']).parent.name}"
+            labels.append(label)
+        var = tk.StringVar(value=labels[0])
+        ttk.Combobox(dlg, textvariable=var, values=labels, state="readonly",
                      width=40).pack(padx=24, pady=4)
 
         def ok():
-            chosen = next((r for r in self.reviews if r["key"] == var.get()), self.reviews[0])
+            try:
+                idx = labels.index(var.get())
+            except ValueError:
+                idx = 0
+            chosen = self.reviews[idx] if 0 <= idx < len(self.reviews) else self.reviews[0]
             dlg.destroy()
             self._review_file(chosen)
 
@@ -918,9 +937,7 @@ class App(TkinterDnD.Tk):
                 text = p.read_text(encoding="utf-8")
             except Exception:
                 continue
-            new = text
-            for old_label, new_label in renames.items():
-                new = new.replace(old_label, new_label)
+            new = transcribe.rename_labels(text, renames)
             if new != text:
                 p.write_text(new, encoding="utf-8")
                 renamed += 1

@@ -11,5 +11,13 @@ transcripts/
 # Downloaded models (re-downloadable; too big for git)
 models/
 
-# Compiled launcher (rebuild with build-exe.ps1)
+# Compiled launchers (rebuild with build-exe.ps1)
 Transcribir.exe
+Transcribir-qt.exe
+*.exe
+
+# Run artifacts (local only, never commit)
+*.log
+perf.json
+settings.json
+*.aligned.json

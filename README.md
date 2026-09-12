@@ -7,9 +7,10 @@
 ![pyannote-audio](https://img.shields.io/badge/pyannote--audio-4.0-FF6600?style=for-the-badge)
 ![ffmpeg](https://img.shields.io/badge/ffmpeg-9.0-007808?style=for-the-badge&logo=ffmpeg&logoColor=white)
 ![CUDA](https://img.shields.io/badge/CUDA-12.8-76B900?style=for-the-badge&logo=nvidia&logoColor=white)
-![GUI](https://img.shields.io/badge/GUI-tkinter-7c4dff?style=for-the-badge)
+![GUI](https://img.shields.io/badge/GUI-Qt+%2B+tkinter-7c4dff?style=for-the-badge)
 
 > **Author:** Juan Pablo Gómez Veira
+>
 > **Year:** August 2026
 
 ---
@@ -26,16 +27,16 @@ Built on [WhisperX](https://github.com/m-bain/whisperX) — faster-whisper for s
 - GPU-accelerated with CUDA (falls back to CPU), quantized int8 to fit low-VRAM cards
 - Speaker diarization: each voice becomes `SPEAKER_00`, `SPEAKER_01`, ...
 - Configurable main speaker: assign a label to the most-spoken speaker automatically (the other voices get grouped as `Hablante 1..N`), or mark it manually by listening to a short audio sample of each voice
-- Main-speaker extract: `*.solo-principal.md` with only the main speaker's lines, written alongside the full transcript
+- Main-speaker extract: `*.solo-principal.md` with only the main speaker's lines, written whenever the main speaker is identified (`--auto-speaker`)
 - Name every voice and merge duplicated ones: two speakers given the same label become one person
-- Hallucination guard: collapses repeated-word loops and drops repeated segments
-- Speech-only diarization: only the regions the transcript marks as speech are diarized (silence skipped, timestamps remapped — subtitles unaffected)
+- Hallucination guard: drops low-confidence segments using Whisper's own `avg_logprob` signal
+- Speech-only diarization: only the regions the transcript marks as speech are diarized (silence skipped, timestamps remapped — subtitles unaffected; CUDA only, skipped automatically on very dense audio)
 - Fast diarization: the segmentation sliding-window step runs at 2s (~2-4x faster than pyannote's 1s default; main-speaker labels hold, the rest just get coarser grouping — `--seg-stride` to tune)
-- Alignment and diarization models are reused across files; the ASR model is unloaded before diarization so it stays fast on low-VRAM cards
+- The ASR model is cached across the batch and unloaded before diarization so it stays fast on low-VRAM cards; the alignment model reloads per file (cheap, ~360MB) and the diarization pipeline stays loaded
 - Graceful GPU-out-of-memory recovery (halves the batch size and retries)
-- Bilingual-friendly: Spanish by default, with a prompt that keeps English technical terms intact
+- Spanish by default, with a domain prompt tuned for classes and meetings
 - One output folder per video, saved next to the original recording
-- Drag-and-drop GUI (`gui.py`) with a clean dark theme and purple accents, dark title bar, live progress bar, phase feedback, stop control, and persistent settings; plus a full CLI (`transcribe.py`)
+- Drag-and-drop GUI (`gui_qt.py`, Qt) with per-file table, dark/light themes, live progress, phase feedback, speaker review with audio playback, finish toast + chime, stop control, and persistent settings; classic tkinter GUI (`gui.py`) as fallback; plus a full CLI (`transcribe.py`)
 
 ## Requirements
 
@@ -63,21 +64,23 @@ Without a token the tool still works — transcripts are produced without speake
 
 ## Usage
 
-### GUI (recommended)
+### GUI (recommended: Qt)
 
 ```powershell
-uv run gui.py
+uv run gui_qt.py
 ```
+
+Two interfaces, same pipeline and results. The Qt GUI (`gui_qt.py`) is the modern one: per-file table with durations and live states, dark/light themes, native file dialogs and drag & drop, speaker review with one-click audio samples, completion toast + chime, and persistent settings. The classic tkinter GUI (`gui.py`) remains as a lightweight fallback.
 
 Drag and drop media files, pick formats/language, and press Transcribir. A progress bar plus a live log show file duration/size, per-phase timing (transcription, alignment, diarization), and detected speakers.
 
-For a double-clickable launcher without a console window, build one once with:
+For double-clickable launchers without a console window, build once with:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File build-exe.ps1
 ```
 
-(`Transcribir.cmd` is the console version — handy for debugging.)
+(`Transcribir.cmd` / `Transcribir-qt.cmd` are the console versions — handy for debugging.)
 
 ### CLI
 
@@ -102,14 +105,14 @@ uv run transcribe.py video.mp4 --lang es --auto-speaker --speaker-name Profesor
 | `--benchmark` | off | Measure this machine's speed (bundled sample), save to `perf.json`, exit |
 | `--auto-speaker` | off | Assign `--speaker-name` to the most-spoken speaker |
 | `--speaker-name` | `Profesor` | Label for the main speaker |
-| `--speaker-clips DIR` | — | Save a short WAV per speaker to listen to the voices (one subfolder per file) |
+| `--speaker-clips DIR` | — | Save up to 3 short WAVs per speaker to listen to the voices (one subfolder per file) |
 | `--no-vad-crop` | off | Diarize the full audio instead of only the speech regions |
 | `--seg-stride` | `2.0` | Segmentation window step (2.0 = ~2-4x faster diarization with negligible main-speaker-label impact; 1.0 = upstream default) |
-| `--no-solo-principal` | on | Skip the main-speaker-only `*.solo-principal.md` extract |
+| `--no-solo-principal` | off | Skip the main-speaker-only `*.solo-principal.md` extract (written by default when `--auto-speaker` identifies the main speaker) |
 
 ## Output layout
 
-Each transcription goes into a folder named after the source file, next to the original video:
+Each transcription goes into a folder named after the source file, next to the original video (defaults: `.md` + `.srt`; request more with `--formats`):
 
 ```text
 media\
@@ -117,8 +120,8 @@ media\
 └── recording-2026-07-28\
     ├── recording-2026-07-28.md
     ├── recording-2026-07-28.srt
-    ├── recording-2026-07-28.vtt
-    └── recording-2026-07-28.txt
+    ├── recording-2026-07-28.solo-principal.md   # only with --auto-speaker
+    └── recording-2026-07-28.aligned.json        # checkpoint, enables resume
 ```
 
 Subtitles are built as broadcast-style cues: at most two lines of ~44 characters, ~5 seconds each — long sentences are split automatically. Load the `.srt` in VLC alongside the recording to verify the transcript against the audio.
@@ -147,10 +150,13 @@ Speed estimates self-calibrate: every run records its measured rates, and --benc
 ```text
 video-transcriber/
 ├── transcribe.py        # core pipeline + CLI
-├── gui.py               # drag-and-drop interface
-├── launcher.cs          # source for the optional exe launcher
-├── build-exe.ps1        # compiles the launcher (csc)
-├── Transcribir.cmd      # console launcher
+├── gui_qt.py            # Qt interface (recommended)
+├── gui.py               # classic tkinter interface (fallback)
+├── launcher-qt.cs       # source for the Qt exe launcher
+├── launcher.cs          # source for the classic exe launcher
+├── build-exe.ps1        # compiles the launchers (csc)
+├── Transcribir.cmd      # console launcher (classic)
+├── Transcribir-qt.cmd   # console launcher (Qt)
 └── pyproject.toml       # uv project (Python 3.12)
 ```
 

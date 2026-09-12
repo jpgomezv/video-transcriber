@@ -453,6 +453,20 @@ def dominant_speaker(segments: list) -> tuple[str | None, float]:
     return best, totals[best]
 
 
+def rename_labels(text: str, renames: dict[str, str]) -> str:
+    """Apply speaker renames in ONE pass so swapping names (A->B, B->A) and
+    labels that appear inside transcript body text can't corrupt each other.
+    Longest display-name first, so 'Hablante 1' wins over 'Hablante'."""
+    items = [(o, n) for o, n in renames.items() if o and n and o != n]
+    if not items:
+        return text
+    import re
+
+    pattern = re.compile("|".join(re.escape(o) for o, _ in
+                                  sorted(items, key=lambda kv: -len(kv[0]))))
+    return pattern.sub(lambda m: dict(items)[m.group(0)], text)
+
+
 def extract_speaker_clips(audio, segments: list, out_dir, clip_seconds: float = 6.0,
                           samples: int = 3) -> dict:
     """Save up to `samples` short WAVs per speaker (their longest turns,
@@ -1185,8 +1199,16 @@ def _diarize_write(prep: dict, args, cache: ModelCache) -> dict | None:
         clips = {}
         if clip_dir:
             # Per-file subfolder: speaker labels repeat in every video of a
-            # batch and would otherwise overwrite each other's samples.
-            clip_dir = Path(clip_dir) / path.stem
+            # batch and would otherwise overwrite each other's samples. The
+            # parent folder is folded in so two same-named videos in one
+            # batch (different folders) can't collide either.
+            stem = f"{path.parent.name}__{path.stem}" if path.parent.name else path.stem
+            target = Path(clip_dir) / stem
+            n = 2
+            while target.exists() and any(target.iterdir()):
+                target = Path(clip_dir) / f"{stem} ({n})"
+                n += 1
+            clip_dir = target
             clips = extract_speaker_clips(audio, segments, clip_dir)
         payload = {"clips": clips, "totals": totals, "names": dict(names), "outputs": []}
 
