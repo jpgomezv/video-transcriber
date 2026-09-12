@@ -1203,6 +1203,11 @@ def main() -> None:
         app.setFont(QFont("Segoe UI", 10))
     except Exception:
         pass
+    try:
+        if ICON_PATH.exists():
+            app.setWindowIcon(QIcon(str(ICON_PATH)))
+    except Exception:
+        pass
     win = MainWindow()
     win.show()
     sys.exit(app.exec())
