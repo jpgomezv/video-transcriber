@@ -131,6 +131,7 @@ class App(TkinterDnD.Tk):
 
         self._build()
         self._apply_saved_settings()
+        self._sync_solo_state()
         self._apply_theme(save=False)
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self.drop_target_register(DND_FILES)
@@ -208,16 +209,18 @@ class App(TkinterDnD.Tk):
         ).grid(row=3, column=0, columnspan=3, sticky="w", pady=3)
 
         self.var_auto_speaker = tk.BooleanVar(value=True)
-        ttk.Checkbutton(
+        self.chk_auto = ttk.Checkbutton(
             grid, text="Marcar al hablante principal automáticamente (el que más habla)",
-            variable=self.var_auto_speaker,
-        ).grid(row=4, column=0, columnspan=3, sticky="w", pady=3)
+            variable=self.var_auto_speaker, command=self._sync_solo_state,
+        )
+        self.chk_auto.grid(row=4, column=0, columnspan=3, sticky="w", pady=3)
 
         self.var_solo_principal = tk.BooleanVar(value=True)
-        ttk.Checkbutton(
+        self.chk_solo = ttk.Checkbutton(
             grid, text="Generar extracto solo del hablante principal (*.solo-principal.md)",
             variable=self.var_solo_principal,
-        ).grid(row=5, column=0, columnspan=3, sticky="w", pady=3)
+        )
+        self.chk_solo.grid(row=5, column=0, columnspan=3, sticky="w", pady=3)
 
         ttk.Label(grid, text="Nombre del hablante principal:").grid(
             row=6, column=0, sticky="w", padx=(0, 10), pady=3
@@ -304,6 +307,10 @@ class App(TkinterDnD.Tk):
                            borderwidth=0, highlightthickness=0,
                            padx=8, pady=6)
         self.log.pack(fill="both", expand=True, padx=6, pady=6)
+
+    def _sync_solo_state(self):
+        """El extracto solo-principal requiere identificar al hablante principal."""
+        self.chk_solo.state(["!disabled"] if self.var_auto_speaker.get() else ["disabled"])
 
     def _on_out_mode(self):
         if self.var_out.get() == "folder" and not self.out_folder:
@@ -406,7 +413,8 @@ class App(TkinterDnD.Tk):
 
     def _save_settings(self) -> None:
         try:
-            data = {
+            data = dict(self.settings)  # preserve keys written by other GUIs
+            data.update({
                 "formats": [k for k, v in self.var_fmts.items() if v.get()],
                 "lang": self.var_lang.get(),
                 "model": self.var_model.get(),
@@ -417,7 +425,8 @@ class App(TkinterDnD.Tk):
                 "speaker_name": self.var_speaker_name.get(),
                 "out_mode": self.var_out.get(),
                 "out_folder": self.out_folder or "",
-            }
+            })
+            self.settings = data
             SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
             SETTINGS_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2),
                                      encoding="utf-8")
@@ -880,10 +889,41 @@ class App(TkinterDnD.Tk):
             self.style.configure("RowB.TFrame", background=self.colors.inputbg)
         except Exception:
             pass
+        # Lista de voces scrolleable: cualquier número de hablantes cabe y el
+        # botón Guardar de abajo siempre queda alcanzable.
+        wrap = ttk.Frame(dlg)
+        wrap.pack(fill="both", expand=True, padx=12, pady=(0, 4))
+        canvas = tk.Canvas(wrap, background=self.colors.bg, highlightthickness=0,
+                           width=560, height=min(420, 60 + 36 * len(speakers)))
+        vsb = ttk.Scrollbar(wrap, orient="vertical", command=canvas.yview)
+        body = ttk.Frame(canvas, style="RowA.TFrame")
+        body_id = canvas.create_window((0, 0), window=body, anchor="nw")
+        canvas.configure(yscrollcommand=vsb.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+
+        def _sync_scroll(_e=None):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def _fit_width(e):
+            canvas.itemconfigure(body_id, width=e.width)
+
+        def _wheel(e):
+            canvas.yview_scroll(int(-e.delta / 120), "units")
+
+        def _unbind_wheel(_e=None):
+            canvas.unbind_all("<MouseWheel>")
+
+        body.bind("<Configure>", _sync_scroll)
+        canvas.bind("<Configure>", _fit_width)
+        canvas.bind("<Enter>", lambda _e: canvas.bind_all("<MouseWheel>", _wheel))
+        canvas.bind("<Leave>", _unbind_wheel)
+        dlg.bind("<Destroy>", _unbind_wheel)
+
         entries: dict[str, ttk.Entry] = {}
         for idx, (sp, secs) in enumerate(speakers):
-            row = ttk.Frame(dlg, style="RowB.TFrame" if idx % 2 else "RowA.TFrame")
-            row.pack(fill="x", padx=12, pady=1)
+            row = ttk.Frame(body, style="RowB.TFrame" if idx % 2 else "RowA.TFrame")
+            row.pack(fill="x", pady=1)
             current = entry["names"].get(sp, sp)
             mins = secs / 60
             ttk.Label(row, text=f"{mins:.1f} min").pack(side="left")
@@ -897,6 +937,8 @@ class App(TkinterDnD.Tk):
             entry_widget.insert(0, current)
             entry_widget.pack(side="left", padx=(4, 0))
             entries[sp] = entry_widget
+        body.update_idletasks()
+        _sync_scroll()
 
         def ok():
             renames: dict[str, str] = {}

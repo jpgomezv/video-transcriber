@@ -21,3 +21,6 @@ Transcribir-qt.exe
 perf.json
 settings.json
 *.aligned.json
+
+# Local agent context (intentionally not shared; see the file itself)
+AGENTS.md

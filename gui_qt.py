@@ -32,8 +32,8 @@ from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QGridLayout,
     QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow, QMessageBox,
     QPlainTextEdit, QProgressBar, QPushButton, QRadioButton,
-    QSystemTrayIcon, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
-    QAbstractItemView,
+    QScrollArea, QSystemTrayIcon, QTableWidget, QTableWidgetItem, QVBoxLayout,
+    QWidget, QAbstractItemView,
 )
 
 SETTINGS_DIR = Path(os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData" / "Local"))) / "video-transcriber"
@@ -406,6 +406,8 @@ class MainWindow(QMainWindow):
         grid.addWidget(self.chk_auto, 4, 0, 1, 3)
         self.chk_solo = QCheckBox("Extracto solo del hablante principal (*.solo-principal.md)")
         self.chk_solo.setChecked(True)
+        self.chk_solo.setToolTip("Requiere marcar al hablante principal automáticamente")
+        self.chk_auto.toggled.connect(self.chk_solo.setEnabled)
         grid.addWidget(self.chk_solo, 5, 0, 1, 3)
         grid.addWidget(QLabel("Nombre del hablante principal:"), 6, 0)
         self.edit_name = QLineEdit("Profesor")
@@ -489,6 +491,7 @@ class MainWindow(QMainWindow):
         root.addWidget(box_run, 1)
 
         self._apply_saved_settings()
+        self.chk_solo.setEnabled(self.chk_auto.isChecked())
         self._apply_theme(save=False)
         self._apply_theme(save=False)
 
@@ -640,7 +643,8 @@ class MainWindow(QMainWindow):
 
     def _save_settings(self) -> None:
         try:
-            data = {
+            data = dict(self.settings)  # preserve keys written by other GUIs
+            data.update({
                 "formats": [k for _label, k, _d in FORMATS if self.fmt_btns[k].isChecked()],
                 "lang": dict(LANGUAGES).get(self.cmb_lang.currentText(), "es"),
                 "model": self.cmb_model.currentText(),
@@ -651,10 +655,13 @@ class MainWindow(QMainWindow):
                 "speaker_name": self.edit_name.text(),
                 "out_mode": "folder" if self.radio_folder.isChecked() else "video",
                 "out_folder": self.out_folder or "",
-            }
+            })
+            if not self.isMinimized() and self.width() >= 700 and self.height() >= 500:
+                data["win_size"] = [self.width(), self.height()]
             SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
             SETTINGS_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2),
                                      encoding="utf-8")
+            self.settings = data
         except Exception:
             pass
 
@@ -688,6 +695,11 @@ class MainWindow(QMainWindow):
             self.lbl_out.setText(self.out_folder)
         if s.get("theme") in ("Oscuro", "Claro"):
             self._theme = s["theme"]
+        sz = s.get("win_size")
+        if (isinstance(sz, list) and len(sz) == 2
+                and all(isinstance(v, int) for v in sz)
+                and sz[0] >= 700 and sz[1] >= 500):
+            self.resize(sz[0], sz[1])
 
     # -------------------------------------------------------------- pipeline
     def _build_args(self) -> argparse.Namespace:
@@ -1036,23 +1048,41 @@ class MainWindow(QMainWindow):
             self._review_file(chosen["r"])
 
     def _review_file(self, entry: dict):
+        dlg = self._build_review_dialog(entry)
+        if dlg is not None:
+            dlg.exec()
+
+    def _build_review_dialog(self, entry: dict) -> QDialog | None:
+        """Speaker-naming dialog: fixed header/footer with a scrollable voice
+        list, so any number of speakers fits and Guardar stays reachable."""
         speakers = sorted(entry["totals"].items(), key=lambda kv: -kv[1])
         if not speakers:
             QMessageBox.information(self, "Sin hablantes",
                                     "Esta transcripción no tiene hablantes identificados.")
-            return
+            return None
         dlg = QDialog(self)
         dlg.setWindowTitle(f"Revisar hablantes — {entry['key']}")
-        dlg.setMinimumWidth(600)
-        lay = QVBoxLayout(dlg)
+        dlg.setMinimumWidth(640)
+        outer = QVBoxLayout(dlg)
         head = QLabel(f"{entry['key']} · {len(speakers)} voces")
         head.setObjectName("section")
-        lay.addWidget(head)
+        outer.addWidget(head)
         info = QLabel("Escucha cada voz y ponle nombre. Dos voces con el mismo "
                       "nombre se fusionan en una sola persona.")
         info.setObjectName("muted")
         info.setWordWrap(True)
-        lay.addWidget(info)
+        outer.addWidget(info)
+
+        scroll = QScrollArea(dlg)
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        body = QWidget()
+        body_lay = QVBoxLayout(body)
+        body_lay.setContentsMargins(0, 0, 8, 0)
+        body_lay.setSpacing(6)
+        scroll.setWidget(body)
+        outer.addWidget(scroll, 1)
+
         player = QMediaPlayer(dlg)
         player.setAudioOutput(QAudioOutput(dlg))
         edits: dict[str, QLineEdit] = {}
@@ -1069,11 +1099,20 @@ class MainWindow(QMainWindow):
             edit.setMaxLength(40)
             row.addWidget(edit, 1)
             edits[sp] = edit
-            lay.addLayout(row)
+            body_lay.addLayout(row)
+        body_lay.addStretch(1)
+
+        footer = QHBoxLayout()
+        footer.addStretch(1)
+        cancel = QPushButton("Cancelar")
+        cancel.setObjectName("ghost")
+        cancel.clicked.connect(dlg.reject)
+        footer.addWidget(cancel)
         save = QPushButton("Guardar")
         save.setObjectName("primary")
         save.setDefault(True)
-        lay.addWidget(save)
+        footer.addWidget(save)
+        outer.addLayout(footer)
 
         def ok():
             renames: dict[str, str] = {}
@@ -1087,7 +1126,14 @@ class MainWindow(QMainWindow):
             dlg.accept()
 
         save.clicked.connect(ok)
-        dlg.exec()
+
+        screen = QApplication.primaryScreen()
+        if screen is not None:
+            avail = screen.availableGeometry()
+            dlg.setMaximumHeight(int(avail.height() * 0.85))
+            dlg.resize(min(760, int(avail.width() * 0.62)),
+                       min(620, int(avail.height() * 0.72)))
+        return dlg
 
     def _play_clip(self, player: QMediaPlayer, path: str):
         try:
